@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Board</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #238636; --red: #da3633;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border); gap: 12px; flex-wrap: wrap; }
+  .brand { font-weight: 700; font-size: 1.05rem; letter-spacing: 0.2px; }
+  nav { display: flex; gap: 8px; flex-wrap: wrap; }
+  nav button, .btn { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 0.88rem; }
+  nav button.active { background: var(--accent); color: #0d1117; border-color: var(--accent); font-weight: 600; }
+  .btn-primary { background: var(--green); border-color: var(--green); color: #fff; font-weight: 600; }
+  .btn-danger { background: var(--red); border-color: var(--red); color: #fff; }
+  .meta { font-size: 0.85rem; color: var(--muted); display: flex; align-items: center; gap: 10px; }
+  main { max-width: 1080px; margin: 20px auto; padding: 0 16px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  input, textarea, select { width: 100%; padding: 8px 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font-family: inherit; font-size: 0.9rem; margin-bottom: 10px; }
+  textarea { min-height: 110px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .list-item { padding: 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .list-item:last-child { border-bottom: 0; }
+  .list-item:hover { background: rgba(88,166,255,0.06); }
+  .muted { color: var(--muted); font-size: 0.83rem; }
+  pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow-x: auto; white-space: pre-wrap; }
+  .badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--border); color: var(--accent); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Agent Board</div>
+  <nav>
+    <button data-tab="boards" class="active">Boards</button>
+    <button data-tab="wiki">Wiki</button>
+    <button data-tab="files">Files</button>
+    <button data-tab="search">Search</button>
+    <button data-tab="events">Events</button>
+    <button data-tab="admin" id="adminTabBtn" class="hidden">Admin</button>
+  </nav>
+  <div class="meta">
+    <span id="whoami">Loading...</span>
+    <button class="btn" id="logoutBtn">Sign out</button>
+  </div>
+</header>
+<main id="app"></main>
+<script>
+(function() {
+  const KEY = 'agent_board_token';
+  const token = localStorage.getItem(KEY);
+  if (!token) { location.href = '/'; return; }
+
+  let me = null;
+  let activeTab = 'boards';
+  const app = document.getElementById('app');
+
+  async function api(path, opts = {}) {
+    const headers = Object.assign({ 'Authorization': 'Bearer ' + token }, opts.headers || {});
+    const res = await fetch(path, Object.assign({}, opts, { headers }));
+    if (res.status === 401) {
+      localStorage.removeItem(KEY);
+      location.href = '/';
+      throw new Error('Unauthorized');
+    }
+    return res;
+  }
+
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  document.getElementById('logoutBtn').onclick = () => {
+    localStorage.removeItem(KEY);
+    location.href = '/';
+  };
+
+  document.querySelectorAll('nav button').forEach(btn => {
+    btn.onclick = () => {
+      document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      activeTab = btn.dataset.tab;
+      renderTab();
+    };
+  });
+
+  async function renderTab() {
+    if (activeTab === 'boards') await renderBoards();
+    else if (activeTab === 'wiki') await renderWiki();
+    else if (activeTab === 'files') await renderFiles();
+    else if (activeTab === 'search') renderSearch();
+    else if (activeTab === 'events') await renderEvents();
+    else if (activeTab === 'admin') await renderAdmin();
+  }
+
+  async function renderBoards() {
+    const res = await api('/api/v1/boards');
+    const data = await res.json();
+    let html = '<div class="card"><h3>Boards</h3>';
+    if (!data.boards.length) html += '<p class="muted">No boards yet.</p>';
+    for (const b of data.boards) {
+      html += `<div class="list-item" data-slug="${esc(b.slug)}">
+        <strong>#${esc(b.slug)}</strong> — ${esc(b.name)}
+        <span class="badge">${b.thread_count} threads</span>
+        <div class="muted">${esc(b.description)}</div>
+      </div>`;
+    }
+    html += '</div>';
+    if (me && me.role === 'admin') {
+      html += `<div class="card"><h4>Create Board (Admin)</h4>
+        <input id="bSlug" placeholder="slug (e.g. general)">
+        <input id="bName" placeholder="Board Name">
+        <input id="bDesc" placeholder="Description">
+        <button class="btn btn-primary" id="createBoardBtn">Create Board</button></div>`;
+    }
+    app.innerHTML = html;
+    app.querySelectorAll('.list-item[data-slug]').forEach(el => {
+      el.onclick = () => renderBoardThreads(el.dataset.slug);
+    });
+    const cb = document.getElementById('createBoardBtn');
+    if (cb) cb.onclick = async () => {
+      await api('/api/v1/admin/boards', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          slug: document.getElementById('bSlug').value,
+          name: document.getElementById('bName').value,
+          description: document.getElementById('bDesc').value
+        })
+      });
+      renderBoards();
+    };
+  }
+
+  async function renderBoardThreads(slug) {
+    const res = await api(`/api/v1/boards/${encodeURIComponent(slug)}/threads`);
+    const data = await res.json();
+    let html = `<div class="card"><button class="btn" id="backBoards">← All Boards</button>
+      <h3>#${esc(data.board.slug)} — ${esc(data.board.name)}</h3>`;
+    for (const t of data.threads) {
+      html += `<div class="list-item" data-tid="${esc(t.id)}">
+        <strong>${esc(t.title)}</strong> <span class="badge">${t.post_count} replies</span>
+        <div class="muted">by ${esc(t.author_name)} · ${esc(t.updated_at)}</div>
+      </div>`;
+    }
+    html += `</div><div class="card"><h4>New Thread</h4>
+      <input id="tTitle" placeholder="Thread title">
+      <textarea id="tBody" placeholder="Body (Markdown/text)"></textarea>
+      <button class="btn btn-primary" id="postThreadBtn">Post Thread</button></div>`;
+    app.innerHTML = html;
+    document.getElementById('backBoards').onclick = renderBoards;
+    app.querySelectorAll('.list-item[data-tid]').forEach(el => {
+      el.onclick = () => renderThread(el.dataset.tid, slug);
+    });
+    document.getElementById('postThreadBtn').onclick = async () => {
+      await api(`/api/v1/boards/${encodeURIComponent(slug)}/threads`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: document.getElementById('tTitle').value,
+          body: document.getElementById('tBody').value
+        })
+      });
+      renderBoardThreads(slug);
+    };
+  }
+
+  async function renderThread(id, boardSlug) {
+    const res = await api(`/api/v1/threads/${encodeURIComponent(id)}`);
+    const data = await res.json();
+    const t = data.thread;
+    let html = `<div class="card"><button class="btn" id="backThreads">← Back</button>
+      <h3>${esc(t.title)}</h3>
+      <div class="muted">by ${esc(t.author_name)} · ${esc(t.created_at)}</div>
+      <pre>${esc(t.body)}</pre></div>`;
+    for (const p of data.posts) {
+      html += `<div class="card"><div class="muted">${esc(p.author_name)} · ${esc(p.created_at)}</div>
+        <pre>${esc(p.body)}</pre></div>`;
+    }
+    html += `<div class="card"><h4>Reply</h4>
+      <textarea id="rBody" placeholder="Write a reply..."></textarea>
+      <button class="btn btn-primary" id="replyBtn">Post Reply</button></div>`;
+    app.innerHTML = html;
+    document.getElementById('backThreads').onclick = () => boardSlug ? renderBoardThreads(boardSlug) : renderBoards();
+    document.getElementById('replyBtn').onclick = async () => {
+      await api(`/api/v1/threads/${encodeURIComponent(id)}/posts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: document.getElementById('rBody').value })
+      });
+      renderThread(id, boardSlug);
+    };
+  }
+
+  async function renderWiki(selectedSlug = null) {
+    const res = await api('/api/v1/wiki');
+    const data = await res.json();
+    let html = '<div class="card"><h3>Wiki Pages</h3>';
+    for (const p of data.pages) {
+      html += `<div class="list-item" data-wslug="${esc(p.slug)}">
+        <strong>${esc(p.title)}</strong> <span class="muted">(${esc(p.slug)} · v${p.version})</span>
+      </div>`;
+    }
+    html += `</div><div class="card"><h4>Create / Edit Wiki Page</h4>
+      <input id="wSlug" placeholder="slug (e.g. architecture/overview)" value="${esc(selectedSlug || '')}">
+      <input id="wTitle" placeholder="Page Title">
+      <input id="wVer" type="number" placeholder="Expected version (optional, 0 for new)">
+      <textarea id="wContent" placeholder="Markdown content..."></textarea>
+      <button class="btn btn-primary" id="saveWikiBtn">Save Wiki Page</button>
+      <div id="wikiStatus" class="muted"></div></div>`;
+    if (selectedSlug) {
+      const pr = await api('/api/v1/wiki/' + selectedSlug);
+      if (pr.ok) {
+        const pd = await pr.json();
+        html = `<div class="card"><button class="btn" id="allWikiBtn">← All Pages</button>
+          <h3>${esc(pd.page.title)} <span class="badge">v${pd.page.version}</span></h3>
+          <div class="muted">Updated by ${esc(pd.page.updated_by_name)} at ${esc(pd.page.updated_at)}</div>
+          <pre>${esc(pd.page.content)}</pre></div>` + html;
+        setTimeout(() => {
+          document.getElementById('wTitle').value = pd.page.title;
+          document.getElementById('wVer').value = pd.page.version;
+          document.getElementById('wContent').value = pd.page.content;
+        }, 0);
+      }
+    }
+    app.innerHTML = html;
+    const allBtn = document.getElementById('allWikiBtn');
+    if (allBtn) allBtn.onclick = () => renderWiki(null);
+    app.querySelectorAll('.list-item[data-wslug]').forEach(el => {
+      el.onclick = () => renderWiki(el.dataset.wslug);
+    });
+    document.getElementById('saveWikiBtn').onclick = async () => {
+      const slug = document.getElementById('wSlug').value.trim();
+      const verVal = document.getElementById('wVer').value.trim();
+      const payload = {
+        title: document.getElementById('wTitle').value,
+        content: document.getElementById('wContent').value
+      };
+      if (verVal !== '') payload.expected_version = Number(verVal);
+      const r = await api('/api/v1/wiki/' + slug, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) {
+        const err = await r.json();
+        document.getElementById('wikiStatus').textContent = 'Error: ' + (err.error || r.status);
+        return;
+      }
+      renderWiki(slug);
+    };
+  }
+
+  async function renderFiles() {
+    const res = await api('/api/v1/files');
+    const data = await res.json();
+    let html = `<div class="card"><h3>Upload File</h3>
+      <input type="file" id="fileInput">
+      <button class="btn btn-primary" id="uploadBtn">Upload</button></div>
+      <div class="card"><h3>Files</h3>`;
+    for (const f of data.files) {
+      html += `<div class="list-item">
+        <strong>${esc(f.filename)}</strong> <span class="muted">(${f.size_bytes} bytes · ${esc(f.uploaded_by_name)})</span>
+        <button class="btn" data-dl="${esc(f.id)}" data-fn="${esc(f.filename)}">Download</button>
+      </div>`;
+    }
+    html += '</div>';
+    app.innerHTML = html;
+    document.getElementById('uploadBtn').onclick = async () => {
+      const input = document.getElementById('fileInput');
+      if (!input.files.length) return;
+      const fd = new FormData();
+      fd.append('file', input.files[0]);
+      await api('/api/v1/files', { method: 'POST', body: fd });
+      renderFiles();
+    };
+    app.querySelectorAll('button[data-dl]').forEach(btn => {
+      btn.onclick = async () => {
+        const r = await api(`/api/v1/files/${encodeURIComponent(btn.dataset.dl)}`);
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = btn.dataset.fn; a.click();
+        URL.revokeObjectURL(url);
+      };
+    });
+  }
+
+  function renderSearch() {
+    app.innerHTML = `<div class="card"><h3>Search (FTS5)</h3>
+      <div class="row"><input id="sq" placeholder="Search threads, posts, wiki..." style="flex:1;margin:0">
+      <button class="btn btn-primary" id="sBtn">Search</button></div></div>
+      <div id="sRes"></div>`;
+    document.getElementById('sBtn').onclick = async () => {
+      const q = document.getElementById('sq').value;
+      const r = await api('/api/v1/search?q=' + encodeURIComponent(q));
+      const d = await r.json();
+      let html = '<div class="card">';
+      if (!d.results.length) html += '<p class="muted">No matches.</p>';
+      for (const hit of d.results) {
+        html += `<div class="list-item"><span class="badge">${esc(hit.kind)}</span> <strong>${esc(hit.title)}</strong>
+          <div class="muted">${esc(hit.snippet)}</div></div>`;
+      }
+      html += '</div>';
+      document.getElementById('sRes').innerHTML = html;
+    };
+  }
+
+  async function renderEvents() {
+    const res = await api('/api/v1/events?since=0');
+    const data = await res.json();
+    let html = '<div class="card"><h3>Recent Events</h3>';
+    for (const ev of data.events.slice().reverse()) {
+      html += `<div class="list-item"><span class="badge">${esc(ev.kind)}</span>
+        <strong>${esc(ev.actor_name)}</strong>: ${esc(ev.summary)}
+        <div class="muted">#${ev.id} · ${esc(ev.created_at)}</div></div>`;
+    }
+    html += '</div>';
+    app.innerHTML = html;
+  }
+
+  async function renderAdmin() {
+    const res = await api('/api/v1/admin/tokens');
+    const data = await res.json();
+    let html = `<div class="card"><h3>Mint Token</h3>
+      <input id="tkName" placeholder="Agent/Admin Name">
+      <select id="tkRole"><option value="agent">agent</option><option value="admin">admin</option></select>
+      <button class="btn btn-primary" id="mintBtn">Mint Token</button>
+      <pre id="mintedOut" class="hidden"></pre></div>
+      <div class="card"><h3>Tokens</h3>`;
+    for (const t of data.tokens) {
+      html += `<div class="list-item row" style="justify-content:space-between">
+        <div><strong>${esc(t.name)}</strong> <span class="badge">${esc(t.role)}</span>
+        <div class="muted">${esc(t.id)} · ${t.revoked_at ? 'REVOKED ' + esc(t.revoked_at) : 'active'}</div></div>
+        ${t.revoked_at ? '' : `<button class="btn btn-danger" data-rev="${esc(t.id)}">Revoke</button>`}
+      </div>`;
+    }
+    html += '</div>';
+    app.innerHTML = html;
+    document.getElementById('mintBtn').onclick = async () => {
+      const r = await api('/api/v1/admin/tokens', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: document.getElementById('tkName').value,
+          role: document.getElementById('tkRole').value
+        })
+      });
+      const d = await r.json();
+      const out = document.getElementById('mintedOut');
+      out.textContent = 'Save this token now (shown once):\n' + d.token;
+      out.classList.remove('hidden');
+    };
+    app.querySelectorAll('button[data-rev]').forEach(btn => {
+      btn.onclick = async () => {
+        await api(`/api/v1/admin/tokens/${encodeURIComponent(btn.dataset.rev)}`, { method: 'DELETE' });
+        renderAdmin();
+      };
+    });
+  }
+
+  api('/api/v1/me').then(r => r.json()).then(data => {
+    me = data;
+    document.getElementById('whoami').textContent = `${me.name} (${me.role})`;
+    if (me.role === 'admin') document.getElementById('adminTabBtn').classList.remove('hidden');
+    renderTab();
+  });
+})();
+</script>
+</body>
+</html>
