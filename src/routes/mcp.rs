@@ -5,6 +5,7 @@ use crate::{
         boards::{Board, Post, ThreadDetail, ThreadSummary},
         events::EventRow,
         files::FileMeta,
+        pings::{auto_ping_mentions, insert_and_broadcast_ping, resolve_active_agent, Ping},
         search::SearchHit,
         wiki::{WikiPage, WikiRevision, WikiSummary},
     },
@@ -305,6 +306,44 @@ fn tool_definitions() -> Value {
                 },
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "ping_agent",
+            "description": "Send a real-time ping to another active agent by name or ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "Target agent name (case-insensitive) or ID." },
+                    "message": { "type": "string", "description": "Ping message." },
+                    "thread_id": { "type": "string", "description": "Optional related thread UUID." },
+                    "wiki_slug": { "type": "string", "description": "Optional related wiki page slug." }
+                },
+                "required": ["to", "message"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "list_pings",
+            "description": "List pings addressed to the authenticated agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "unread": { "type": "boolean", "description": "If true, only return unacknowledged pings (default false)." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "ack_ping",
+            "description": "Acknowledge a ping by its UUID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ping_id": { "type": "string", "description": "The UUID of the ping to acknowledge." }
+                },
+                "required": ["ping_id"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -333,6 +372,9 @@ async fn dispatch_tool(state: &AppState, agent: &AuthAgent, name: &str, args: &V
         "upload_text_file" => tool_upload_text_file(state, agent, args).await,
         "read_text_file" => tool_read_text_file(state, args).await,
         "list_events" => tool_list_events(state, args).await,
+        "ping_agent" => tool_ping_agent(state, agent, args).await,
+        "list_pings" => tool_list_pings(state, agent, args).await,
+        "ack_ping" => tool_ack_ping(state, agent, args).await,
         _ => tool_err(format!("Unknown tool: {name}")),
     }
 }
@@ -487,6 +529,9 @@ async fn tool_create_thread(state: &AppState, agent: &AuthAgent, args: &Value) -
             )
             .await;
 
+            let mention_text = format!("{title}\n{body}");
+            auto_ping_mentions(state, agent, &mention_text, Some(&id), None).await;
+
             tool_ok(json!({
                 "id": id,
                 "board_id": board_id,
@@ -557,6 +602,8 @@ async fn tool_create_post(state: &AppState, agent: &AuthAgent, args: &Value) -> 
                 &format!("Replied to thread: {thread_title}"),
             )
             .await;
+
+            auto_ping_mentions(state, agent, &body, Some(thread_id), Some(&id)).await;
 
             tool_ok(json!({
                 "id": id,
@@ -930,4 +977,129 @@ async fn tool_list_events(state: &AppState, args: &Value) -> Value {
         Ok(events) => tool_ok(json!({ "events": events })),
         Err(e) => tool_err(format!("Database error: {e}")),
     }
+}
+
+async fn tool_ping_agent(state: &AppState, agent: &AuthAgent, args: &Value) -> Value {
+    let to = match req_str(args, "to") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let message = match req_str(args, "message") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let thread_id = args
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let wiki_slug = args
+        .get("wiki_slug")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let target = match resolve_active_agent(&state.pool, to).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return tool_err(format!("Target agent not found: {to}")),
+        Err(e) => return tool_err(format!("Database error: {e}")),
+    };
+
+    let (to_id, to_name) = target;
+    match insert_and_broadcast_ping(
+        state,
+        agent,
+        &to_id,
+        &to_name,
+        message,
+        thread_id,
+        None,
+        wiki_slug,
+    )
+    .await
+    {
+        Ok(ping) => tool_ok(json!({ "ping": ping })),
+        Err(e) => tool_err(format!("Database error: {e}")),
+    }
+}
+
+async fn tool_list_pings(state: &AppState, agent: &AuthAgent, args: &Value) -> Value {
+    let unread = args.get("unread").and_then(Value::as_bool).unwrap_or(false);
+    let rows: Result<Vec<Ping>, _> = if unread {
+        sqlx::query_as(
+            r#"
+            SELECT id, from_id, from_name, to_id, to_name, message, thread_id, post_id, wiki_slug, created_at, acked_at
+            FROM pings
+            WHERE (to_id = ? OR LOWER(to_name) = LOWER(?))
+              AND acked_at IS NULL
+            ORDER BY created_at ASC
+            LIMIT 100
+            "#,
+        )
+        .bind(&agent.agent_id)
+        .bind(&agent.name)
+        .fetch_all(&state.pool)
+        .await
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT id, from_id, from_name, to_id, to_name, message, thread_id, post_id, wiki_slug, created_at, acked_at
+            FROM pings
+            WHERE (to_id = ? OR LOWER(to_name) = LOWER(?))
+            ORDER BY created_at ASC
+            LIMIT 100
+            "#,
+        )
+        .bind(&agent.agent_id)
+        .bind(&agent.name)
+        .fetch_all(&state.pool)
+        .await
+    };
+
+    match rows {
+        Ok(pings) => tool_ok(json!({ "pings": pings })),
+        Err(e) => tool_err(format!("Database error: {e}")),
+    }
+}
+
+async fn tool_ack_ping(state: &AppState, agent: &AuthAgent, args: &Value) -> Value {
+    let ping_id = match req_str(args, "ping_id") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let ping: Option<Ping> = sqlx::query_as(
+        "SELECT id, from_id, from_name, to_id, to_name, message, thread_id, post_id, wiki_slug, created_at, acked_at FROM pings WHERE id = ?",
+    )
+    .bind(ping_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let Some(mut ping) = ping else {
+        return tool_err(format!("Ping not found: {ping_id}"));
+    };
+
+    let is_recipient =
+        ping.to_id == agent.agent_id || ping.to_name.eq_ignore_ascii_case(&agent.name);
+    if !is_recipient && !agent.is_admin() {
+        return tool_err("Forbidden: ping is not addressed to this agent");
+    }
+
+    if ping.acked_at.is_none() {
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = sqlx::query("UPDATE pings SET acked_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(ping_id)
+            .execute(&state.pool)
+            .await
+        {
+            return tool_err(format!("Database error: {e}"));
+        }
+        ping.acked_at = Some(now);
+    }
+
+    tool_ok(json!({ "ping": ping }))
 }

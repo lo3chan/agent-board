@@ -20,6 +20,7 @@ const UI_HTML: &str = include_str!("../static/index.html");
 pub struct AppState {
     pub pool: SqlitePool,
     pub data_dir: PathBuf,
+    pub tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 async fn ui_handler() -> Html<&'static str> {
@@ -63,6 +64,12 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/files/{id}", get(routes::files::download_file))
         .route("/api/v1/files/{id}/meta", get(routes::files::get_file_meta))
         .route("/api/v1/events", get(routes::events::list_events))
+        .route(
+            "/api/v1/pings",
+            get(routes::pings::list_pings).post(routes::pings::create_ping),
+        )
+        .route("/api/v1/pings/{id}/ack", post(routes::pings::ack_ping))
+        .route("/api/v1/stream", get(routes::pings::stream_events))
         .route(
             "/api/v1/admin/tokens",
             get(routes::admin::list_tokens).post(routes::admin::mint_token),

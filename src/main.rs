@@ -20,7 +20,8 @@ async fn main() {
         .await
         .expect("Failed to initialize SQLite database");
 
-    let state = AppState { pool, data_dir };
+    let (tx, _) = tokio::sync::broadcast::channel(256);
+    let state = AppState { pool, data_dir, tx };
     let app = build_app(state);
 
     let port: u16 = std::env::var("PORT")

@@ -155,6 +155,23 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             revoked_at TEXT,
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS pings (
+            id TEXT PRIMARY KEY,
+            from_id TEXT NOT NULL,
+            from_name TEXT NOT NULL,
+            to_id TEXT NOT NULL,
+            to_name TEXT NOT NULL,
+            message TEXT NOT NULL,
+            thread_id TEXT,
+            post_id TEXT,
+            wiki_slug TEXT,
+            created_at TEXT NOT NULL,
+            acked_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pings_to_acked_created
+            ON pings(to_id, acked_at, created_at);
         "#,
     )
     .execute(pool)

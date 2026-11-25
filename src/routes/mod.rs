@@ -4,5 +4,6 @@ pub mod events;
 pub mod files;
 pub mod mcp;
 pub mod oauth;
+pub mod pings;
 pub mod search;
 pub mod wiki;

@@ -1,6 +1,7 @@
 use crate::{
     auth::AuthAgent,
     db::{record_event, upsert_search_index},
+    routes::pings::auto_ping_mentions,
     AppState,
 };
 use axum::{
@@ -255,6 +256,9 @@ pub async fn create_thread(
             )
             .await;
 
+            let mention_text = format!("{title}\n{body}");
+            auto_ping_mentions(&state, &agent, &mention_text, Some(&id), None).await;
+
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
@@ -357,6 +361,8 @@ pub async fn create_post(
                 &format!("Replied to thread: {thread_title}"),
             )
             .await;
+
+            auto_ping_mentions(&state, &agent, &body, Some(&thread_id), Some(&id)).await;
 
             (
                 StatusCode::CREATED,

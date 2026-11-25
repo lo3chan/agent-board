@@ -15,9 +15,11 @@ async fn setup_app() -> (Router, TempDir) {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("test.db");
     let pool = init_db(&db_path, Some(BOOTSTRAP_ADMIN)).await.unwrap();
+    let (tx, _) = tokio::sync::broadcast::channel(256);
     let state = AppState {
         pool,
         data_dir: dir.path().to_path_buf(),
+        tx,
     };
     (build_app(state), dir)
 }
@@ -47,6 +49,9 @@ async fn all_routes_require_auth_401() {
         (Method::GET, "/api/v1/files"),
         (Method::POST, "/api/v1/files"),
         (Method::GET, "/api/v1/events"),
+        (Method::GET, "/api/v1/pings"),
+        (Method::POST, "/api/v1/pings"),
+        (Method::GET, "/api/v1/stream"),
         (Method::GET, "/api/v1/admin/tokens"),
         (Method::POST, "/api/v1/admin/tokens"),
     ];
@@ -721,7 +726,7 @@ async fn oauth_discovery_dcr_pkce_and_mcp_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let list_resp = body_json(resp).await;
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 17);
 
     // Call `me` tool -> resolves to Gemini identity
     let resp = app
@@ -907,4 +912,382 @@ async fn oauth_discovery_dcr_pkce_and_mcp_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn pings_mentions_sse_and_mcp_flow() {
+    let (app, _dir) = setup_app().await;
+    let admin_auth = format!("Bearer {BOOTSTRAP_ADMIN}");
+
+    // Mint two agent tokens: Doc and Gemini
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/tokens")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"name": "Doc", "role": "agent"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let doc_token = body_json(resp).await["token"].as_str().unwrap().to_string();
+    let doc_auth = format!("Bearer {doc_token}");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/tokens")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"name": "Gemini", "role": "agent"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let gemini_token = body_json(resp).await["token"].as_str().unwrap().to_string();
+    let gemini_auth = format!("Bearer {gemini_token}");
+
+    // 1. POST /api/v1/pings -> 404 for unknown target
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/pings")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"to": "nonexistent", "message": "hello"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 2. POST /api/v1/pings (case-insensitive name) -> 201 Created
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/pings")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "to": "doc",
+                        "message": "Please review wiki/ops",
+                        "wiki_slug": "ops"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let ping_created = body_json(resp).await;
+    let ping_id = ping_created["ping"]["id"].as_str().unwrap().to_string();
+    assert_eq!(ping_created["ping"]["to_name"], "Doc");
+    assert_eq!(ping_created["ping"]["from_name"], "Antigravity");
+    assert_eq!(ping_created["ping"]["wiki_slug"], "ops");
+    assert!(ping_created["ping"]["acked_at"].is_null());
+
+    // 3. GET /api/v1/pings?unread=true as Doc
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pings?unread=true")
+                .header(header::AUTHORIZATION, &doc_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let unread_list = body_json(resp).await;
+    assert_eq!(unread_list["pings"].as_array().unwrap().len(), 1);
+    assert_eq!(unread_list["pings"][0]["id"], ping_id);
+
+    // 4. POST /api/v1/pings/{id}/ack as Doc
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/pings/{ping_id}/ack"))
+                .header(header::AUTHORIZATION, &doc_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let acked = body_json(resp).await;
+    assert!(acked["ping"]["acked_at"].is_string());
+
+    // Unread is now 0, all is 1
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pings?unread=true")
+                .header(header::AUTHORIZATION, &doc_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["pings"].as_array().unwrap().len(), 0);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pings")
+                .header(header::AUTHORIZATION, &doc_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["pings"].as_array().unwrap().len(), 1);
+
+    // 5. @mention auto-ping on create_post
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/boards")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"slug": "general", "name": "General"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/boards/general/threads")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"title": "Sync", "body": "Initial thread"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let tid = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/threads/{tid}/posts"))
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"body": "Hey @Doc and @gemini, please check this!"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let pid = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+    // Both Doc and Gemini should have 1 unread ping referencing tid & pid
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pings?unread=true")
+                .header(header::AUTHORIZATION, &doc_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let doc_unread = body_json(resp).await;
+    assert_eq!(doc_unread["pings"].as_array().unwrap().len(), 1);
+    assert_eq!(doc_unread["pings"][0]["thread_id"], tid);
+    assert_eq!(doc_unread["pings"][0]["post_id"], pid);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pings?unread=true")
+                .header(header::AUTHORIZATION, &gemini_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let gem_unread = body_json(resp).await;
+    assert_eq!(gem_unread["pings"].as_array().unwrap().len(), 1);
+    assert_eq!(gem_unread["pings"][0]["thread_id"], tid);
+    assert_eq!(gem_unread["pings"][0]["post_id"], pid);
+
+    // 6. SSE stream endpoint returns 200 text/event-stream
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stream?filter=me")
+                .header(header::AUTHORIZATION, &doc_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(ct.contains("text/event-stream"));
+
+    // 7. MCP tools/list has 17 tools and ping_agent / list_pings / ack_ping work
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &doc_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tools_resp = body_json(resp).await;
+    let tools = tools_resp["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 17);
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"ping_agent"));
+    assert!(names.contains(&"list_pings"));
+    assert!(names.contains(&"ack_ping"));
+
+    // Doc calls ping_agent -> Gemini
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &doc_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "ping_agent",
+                            "arguments": {
+                                "to": "Gemini",
+                                "message": "MCP ping test",
+                                "thread_id": tid
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mcp_ping_resp = body_json(resp).await;
+    assert_eq!(mcp_ping_resp["result"]["isError"], false);
+    let mcp_ping_val: Value =
+        serde_json::from_str(mcp_ping_resp["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+    let mcp_ping_id = mcp_ping_val["ping"]["id"].as_str().unwrap().to_string();
+
+    // Gemini calls list_pings (unread=true)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &gemini_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "list_pings",
+                            "arguments": { "unread": true }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list_resp = body_json(resp).await;
+    let list_val: Value =
+        serde_json::from_str(list_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(list_val["pings"].as_array().unwrap().len(), 2);
+
+    // Gemini calls ack_ping
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &gemini_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "ack_ping",
+                            "arguments": { "ping_id": mcp_ping_id }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ack_resp = body_json(resp).await;
+    assert_eq!(ack_resp["result"]["isError"], false);
+    let ack_val: Value =
+        serde_json::from_str(ack_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(ack_val["ping"]["acked_at"].is_string());
 }
