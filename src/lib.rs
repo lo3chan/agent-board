@@ -68,6 +68,30 @@ pub fn build_app(state: AppState) -> Router {
             get(routes::admin::list_tokens).post(routes::admin::mint_token),
         )
         .route("/api/v1/admin/tokens/{id}", delete(routes::admin::revoke_token))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(routes::oauth::protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(routes::oauth::protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(routes::oauth::authorization_server_metadata),
+        )
+        .route("/oauth/register", post(routes::oauth::register_client))
+        .route(
+            "/oauth/authorize",
+            get(routes::oauth::authorize_get).post(routes::oauth::authorize_post),
+        )
+        .route("/oauth/token", post(routes::oauth::token_endpoint))
+        .route(
+            "/mcp",
+            get(routes::mcp::mcp_get)
+                .post(routes::mcp::mcp_post)
+                .delete(routes::mcp::mcp_delete),
+        )
         .fallback(not_found_handler)
         .layer(DefaultBodyLimit::max(routes::files::MAX_UPLOAD_BYTES))
         .layer(TraceLayer::new_for_http())

@@ -29,7 +29,14 @@ pub fn hash_token(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub fn generate_token(role: &str) -> String {
+pub fn public_base_url() -> String {
+    std::env::var("PUBLIC_BASE_URL")
+        .unwrap_or_else(|_| "https://board.gettysburgbeacon.com".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+pub fn generate_prefixed_token(prefix: &str) -> String {
     const CHARSET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut rng = rand::rng();
     let suffix: String = (0..32)
@@ -39,8 +46,12 @@ pub fn generate_token(role: &str) -> String {
         })
         .collect();
 
-    let prefix = if role == "admin" { "ab_adm_" } else { "ab_agt_" };
     format!("{prefix}{suffix}")
+}
+
+pub fn generate_token(role: &str) -> String {
+    let prefix = if role == "admin" { "ab_adm_" } else { "ab_agt_" };
+    generate_prefixed_token(prefix)
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -122,11 +133,32 @@ const TOKEN_GATE_HTML: &str = r#"<!DOCTYPE html>
 </html>
 "#;
 
-fn unauthorized_response(is_root_get: bool, headers: &HeaderMap) -> Response {
+fn is_public_oauth_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/.well-known/oauth-protected-resource"
+            | "/.well-known/oauth-protected-resource/mcp"
+            | "/.well-known/oauth-authorization-server"
+            | "/oauth/register"
+            | "/oauth/authorize"
+            | "/oauth/token"
+    )
+}
+
+fn unauthorized_response(is_root_get: bool, is_mcp: bool, headers: &HeaderMap) -> Response {
+    let www_auth = if is_mcp {
+        format!(
+            "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+            public_base_url()
+        )
+    } else {
+        "Bearer".to_string()
+    };
+
     if is_root_get && wants_html(headers) {
         return (
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
+            [(header::WWW_AUTHENTICATE, www_auth)],
             Html(TOKEN_GATE_HTML),
         )
             .into_response();
@@ -134,7 +166,7 @@ fn unauthorized_response(is_root_get: bool, headers: &HeaderMap) -> Response {
 
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
+        [(header::WWW_AUTHENTICATE, www_auth)],
         Json(serde_json::json!({ "error": "unauthorized" })),
     )
         .into_response()
@@ -145,32 +177,73 @@ pub async fn require_auth(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let is_root_get = req.method() == axum::http::Method::GET && req.uri().path() == "/";
+    let path = req.uri().path();
+    if is_public_oauth_path(path) {
+        return next.run(req).await;
+    }
+
+    let is_root_get = req.method() == axum::http::Method::GET && path == "/";
+    let is_mcp = path == "/mcp";
 
     let Some(token) = extract_bearer_token(req.headers()) else {
-        return unauthorized_response(is_root_get, req.headers());
+        return unauthorized_response(is_root_get, is_mcp, req.headers());
     };
 
     let token_hash = hash_token(token);
-    let row: Option<(String, String, String)> = match sqlx::query_as(
-        "SELECT id, name, role FROM tokens WHERE token_hash = ? AND revoked_at IS NULL",
-    )
-    .bind(&token_hash)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal_error" })),
-            )
-                .into_response()
+    let row: Option<(String, String, String)> = if token.starts_with("ab_oat_") {
+        let oauth_row: Result<Option<(String, String, String, String)>, _> = sqlx::query_as(
+            r#"
+            SELECT t.id, t.name, t.role, o.expires_at
+            FROM oauth_tokens o
+            JOIN tokens t ON t.id = o.token_id
+            WHERE o.access_token_hash = ? AND o.revoked_at IS NULL AND t.revoked_at IS NULL
+            "#,
+        )
+        .bind(&token_hash)
+        .fetch_optional(&state.pool)
+        .await;
+
+        match oauth_row {
+            Ok(Some((id, name, role, expires_at))) => {
+                let not_expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
+                    .map(|dt| dt > chrono::Utc::now())
+                    .unwrap_or(false);
+                if not_expired {
+                    Some((id, name, role))
+                } else {
+                    None
+                }
+            }
+            Ok(None) => None,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "internal_error" })),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        match sqlx::query_as(
+            "SELECT id, name, role FROM tokens WHERE token_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(&token_hash)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "internal_error" })),
+                )
+                    .into_response()
+            }
         }
     };
 
     let Some((agent_id, name, role)) = row else {
-        return unauthorized_response(is_root_get, req.headers());
+        return unauthorized_response(is_root_get, is_mcp, req.headers());
     };
 
     req.extensions_mut().insert(AuthAgent {

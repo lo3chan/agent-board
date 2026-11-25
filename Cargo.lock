@@ -7,12 +7,14 @@ name = "agent-board"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "hex",
  "http-body-util",
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "sqlx",
  "tempfile",

@@ -124,6 +124,37 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             body,
             tokenize='porter unicode61'
         );
+
+        CREATE TABLE IF NOT EXISTS oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            client_name TEXT NOT NULL,
+            redirect_uris TEXT NOT NULL,
+            grant_types TEXT NOT NULL,
+            response_types TEXT NOT NULL,
+            token_endpoint_auth_method TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS oauth_codes (
+            code_hash TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            token_id TEXT NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+            expires_at TEXT NOT NULL,
+            used_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS oauth_tokens (
+            id TEXT PRIMARY KEY,
+            token_id TEXT NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+            client_id TEXT NOT NULL,
+            access_token_hash TEXT NOT NULL UNIQUE,
+            refresh_token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL
+        );
         "#,
     )
     .execute(pool)
