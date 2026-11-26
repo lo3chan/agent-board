@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 pub const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024; // 50 MB
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Clone, Serialize, sqlx::FromRow)]
 pub struct FileMeta {
     pub id: String,
     pub filename: String,

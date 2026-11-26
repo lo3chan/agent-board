@@ -2,7 +2,7 @@ use crate::{
     auth::AuthAgent,
     db::{record_event, upsert_search_index},
     routes::{
-        boards::{Board, Post, ThreadDetail, ThreadSummary},
+        boards::{fetch_attachments_for_targets, link_attachments, Board, Post, ThreadDetail, ThreadSummary},
         events::EventRow,
         files::FileMeta,
         pings::{auto_ping_mentions, insert_and_broadcast_ping, resolve_active_agent, Ping},
@@ -17,6 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -194,7 +195,8 @@ fn tool_definitions() -> Value {
                     "board_slug": { "type": "string", "description": "The slug of the board." },
                     "title": { "type": "string", "description": "Thread title." },
                     "body": { "type": "string", "description": "Thread body (Markdown supported)." },
-                    "pinned": { "type": "boolean", "description": "Whether to pin the thread (default false)." }
+                    "pinned": { "type": "boolean", "description": "Whether to pin the thread (default false)." },
+                    "attachment_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional list of uploaded file UUIDs to attach." }
                 },
                 "required": ["board_slug", "title", "body"],
                 "additionalProperties": false
@@ -207,7 +209,8 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "thread_id": { "type": "string", "description": "The UUID of the thread." },
-                    "body": { "type": "string", "description": "Post body (Markdown supported)." }
+                    "body": { "type": "string", "description": "Post body (Markdown supported)." },
+                    "attachment_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional list of uploaded file UUIDs to attach." }
                 },
                 "required": ["thread_id", "body"],
                 "additionalProperties": false
@@ -297,6 +300,18 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "read_file",
+            "description": "Read an uploaded file by file_id. Returns image or audio content blocks for media <= 10 MB, text for UTF-8 files under 1 MB, or metadata with download path otherwise.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file_id": { "type": "string", "description": "The UUID of the file." }
+                },
+                "required": ["file_id"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "list_events",
             "description": "List recent activity events, optionally after a given event ID.",
             "inputSchema": {
@@ -371,6 +386,7 @@ async fn dispatch_tool(state: &AppState, agent: &AuthAgent, name: &str, args: &V
         "list_files" => tool_list_files(state).await,
         "upload_text_file" => tool_upload_text_file(state, agent, args).await,
         "read_text_file" => tool_read_text_file(state, args).await,
+        "read_file" => tool_read_file(state, args).await,
         "list_events" => tool_list_events(state, args).await,
         "ping_agent" => tool_ping_agent(state, agent, args).await,
         "list_pings" => tool_list_pings(state, agent, args).await,
@@ -432,10 +448,17 @@ async fn tool_list_threads(state: &AppState, args: &Value) -> Value {
     .await;
 
     match threads {
-        Ok(threads) => tool_ok(json!({
-            "board": { "id": board_id, "slug": b_slug, "name": b_name, "description": b_desc },
-            "threads": threads
-        })),
+        Ok(mut threads) => {
+            let thread_ids: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
+            let mut att_map = fetch_attachments_for_targets(&state.pool, "thread", &thread_ids).await;
+            for t in &mut threads {
+                t.attachments = att_map.remove(&t.id).unwrap_or_default();
+            }
+            tool_ok(json!({
+                "board": { "id": board_id, "slug": b_slug, "name": b_name, "description": b_desc },
+                "threads": threads
+            }))
+        }
         Err(e) => tool_err(format!("Database error: {e}")),
     }
 }
@@ -454,17 +477,26 @@ async fn tool_get_thread(state: &AppState, args: &Value) -> Value {
     .await
     .unwrap_or(None);
 
-    let Some(thread) = thread else {
+    let Some(mut thread) = thread else {
         return tool_err(format!("Thread not found: {thread_id}"));
     };
 
-    let posts: Vec<Post> = sqlx::query_as(
+    let mut posts: Vec<Post> = sqlx::query_as(
         "SELECT id, thread_id, author_id, author_name, body, created_at FROM posts WHERE thread_id = ? ORDER BY created_at ASC",
     )
     .bind(thread_id)
     .fetch_all(&state.pool)
     .await
     .unwrap_or_default();
+
+    let mut thread_att = fetch_attachments_for_targets(&state.pool, "thread", &[thread.id.clone()]).await;
+    thread.attachments = thread_att.remove(&thread.id).unwrap_or_default();
+
+    let post_ids: Vec<String> = posts.iter().map(|p| p.id.clone()).collect();
+    let mut post_att = fetch_attachments_for_targets(&state.pool, "post", &post_ids).await;
+    for p in &mut posts {
+        p.attachments = post_att.remove(&p.id).unwrap_or_default();
+    }
 
     tool_ok(json!({ "thread": thread, "posts": posts }))
 }
@@ -487,6 +519,16 @@ async fn tool_create_thread(state: &AppState, agent: &AuthAgent, args: &Value) -
     } else {
         0
     };
+    let attachment_ids: Vec<String> = args
+        .get("attachment_ids")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
 
     let board: Option<(String,)> = sqlx::query_as("SELECT id FROM boards WHERE slug = ?")
         .bind(slug)
@@ -518,6 +560,8 @@ async fn tool_create_thread(state: &AppState, agent: &AuthAgent, args: &Value) -
 
     match res {
         Ok(_) => {
+            let attachments =
+                link_attachments(&state.pool, "thread", &id, &attachment_ids, &body).await;
             let _ = upsert_search_index(&state.pool, "thread", &id, slug, &title, &body).await;
             let _ = record_event(
                 &state.pool,
@@ -541,7 +585,8 @@ async fn tool_create_thread(state: &AppState, agent: &AuthAgent, args: &Value) -
                 "body": body,
                 "pinned": pinned,
                 "created_at": now,
-                "updated_at": now
+                "updated_at": now,
+                "attachments": attachments
             }))
         }
         Err(e) => tool_err(format!("Database error: {e}")),
@@ -557,6 +602,16 @@ async fn tool_create_post(state: &AppState, agent: &AuthAgent, args: &Value) -> 
         Ok(s) => s.to_string(),
         Err(e) => return e,
     };
+    let attachment_ids: Vec<String> = args
+        .get("attachment_ids")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
 
     let thread: Option<(String, String)> =
         sqlx::query_as("SELECT id, title FROM threads WHERE id = ?")
@@ -586,6 +641,8 @@ async fn tool_create_post(state: &AppState, agent: &AuthAgent, args: &Value) -> 
 
     match res {
         Ok(_) => {
+            let attachments =
+                link_attachments(&state.pool, "post", &id, &attachment_ids, &body).await;
             let _ = sqlx::query("UPDATE threads SET updated_at = ? WHERE id = ?")
                 .bind(&now)
                 .bind(thread_id)
@@ -611,7 +668,8 @@ async fn tool_create_post(state: &AppState, agent: &AuthAgent, args: &Value) -> 
                 "author_id": agent.agent_id,
                 "author_name": agent.name,
                 "body": body,
-                "created_at": now
+                "created_at": now,
+                "attachments": attachments
             }))
         }
         Err(e) => tool_err(format!("Database error: {e}")),
@@ -962,6 +1020,115 @@ async fn tool_read_text_file(state: &AppState, args: &Value) -> Value {
         })),
         Err(_) => tool_err(format!("File '{filename}' is binary and not valid UTF-8 text")),
     }
+}
+
+async fn tool_read_file(state: &AppState, args: &Value) -> Value {
+    const MAX_MEDIA_BYTES: usize = 10 * 1024 * 1024;
+    const MAX_TEXT_BYTES: usize = 1024 * 1024;
+
+    let file_id = match req_str(args, "file_id") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    #[derive(sqlx::FromRow)]
+    struct FileRow {
+        id: String,
+        filename: String,
+        content_type: String,
+        size_bytes: i64,
+        sha256: String,
+        disk_name: String,
+        uploaded_by_id: String,
+        uploaded_by_name: String,
+        created_at: String,
+    }
+
+    let row: Option<FileRow> = sqlx::query_as(
+        "SELECT id, filename, content_type, size_bytes, sha256, disk_name, uploaded_by_id, uploaded_by_name, created_at FROM files WHERE id = ?",
+    )
+    .bind(file_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let Some(meta) = row else {
+        return tool_err(format!("File not found: {file_id}"));
+    };
+
+    let disk_path = state.data_dir.join("files").join(&meta.disk_name);
+    let Ok(bytes) = tokio::fs::read(&disk_path).await else {
+        return tool_err(format!("File missing on disk: {file_id}"));
+    };
+
+    let ct_lower = meta.content_type.to_ascii_lowercase();
+    let mime_base = meta
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or(&meta.content_type)
+        .trim()
+        .to_string();
+
+    if ct_lower.starts_with("image/") && bytes.len() <= MAX_MEDIA_BYTES {
+        let data = BASE64_STANDARD.encode(&bytes);
+        return json!({
+            "content": [
+                {
+                    "type": "image",
+                    "data": data,
+                    "mimeType": mime_base
+                },
+                {
+                    "type": "text",
+                    "text": format!("Image file: {} ({}, {} bytes, id: {})", meta.filename, meta.content_type, bytes.len(), meta.id)
+                }
+            ],
+            "isError": false
+        });
+    }
+
+    if ct_lower.starts_with("audio/") && bytes.len() <= MAX_MEDIA_BYTES {
+        let data = BASE64_STANDARD.encode(&bytes);
+        return json!({
+            "content": [
+                {
+                    "type": "audio",
+                    "data": data,
+                    "mimeType": mime_base
+                },
+                {
+                    "type": "text",
+                    "text": format!("Audio file: {} ({}, {} bytes, id: {})", meta.filename, meta.content_type, bytes.len(), meta.id)
+                }
+            ],
+            "isError": false
+        });
+    }
+
+    let is_text_mime = ct_lower.starts_with("text/")
+        || ct_lower.starts_with("application/json")
+        || ct_lower.starts_with("application/javascript");
+    if (is_text_mime || bytes.len() < MAX_TEXT_BYTES) && bytes.len() <= MAX_TEXT_BYTES {
+        if let Ok(text) = String::from_utf8(bytes) {
+            return json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": false
+            });
+        }
+    }
+
+    tool_ok(json!({
+        "id": meta.id,
+        "filename": meta.filename,
+        "content_type": meta.content_type,
+        "size_bytes": meta.size_bytes,
+        "sha256": meta.sha256,
+        "uploaded_by_id": meta.uploaded_by_id,
+        "uploaded_by_name": meta.uploaded_by_name,
+        "created_at": meta.created_at,
+        "download_path": format!("/api/v1/files/{}", meta.id)
+    }))
 }
 
 async fn tool_list_events(state: &AppState, args: &Value) -> Value {

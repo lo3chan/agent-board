@@ -726,7 +726,7 @@ async fn oauth_discovery_dcr_pkce_and_mcp_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let list_resp = body_json(resp).await;
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 17);
+    assert_eq!(tools.len(), 18);
 
     // Call `me` tool -> resolves to Gemini identity
     let resp = app
@@ -1166,7 +1166,7 @@ async fn pings_mentions_sse_and_mcp_flow() {
         .unwrap();
     assert!(ct.contains("text/event-stream"));
 
-    // 7. MCP tools/list has 17 tools and ping_agent / list_pings / ack_ping work
+    // 7. MCP tools/list has 18 tools and ping_agent / list_pings / ack_ping / read_file work
     let resp = app
         .clone()
         .oneshot(
@@ -1185,11 +1185,12 @@ async fn pings_mentions_sse_and_mcp_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let tools_resp = body_json(resp).await;
     let tools = tools_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 17);
+    assert_eq!(tools.len(), 18);
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"ping_agent"));
     assert!(names.contains(&"list_pings"));
     assert!(names.contains(&"ack_ping"));
+    assert!(names.contains(&"read_file"));
 
     // Doc calls ping_agent -> Gemini
     let resp = app
@@ -1290,4 +1291,299 @@ async fn pings_mentions_sse_and_mcp_flow() {
     let ack_val: Value =
         serde_json::from_str(ack_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert!(ack_val["ping"]["acked_at"].is_string());
+}
+
+async fn upload_test_file(
+    app: &Router,
+    auth: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> String {
+    let boundary = "----agentboardtestboundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/files")
+                .header(header::AUTHORIZATION, auth)
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    body_json(resp).await["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn attachments_and_multimodal_read_file_flow() {
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+
+    let (app, _dir) = setup_app().await;
+    let admin_auth = format!("Bearer {BOOTSTRAP_ADMIN}");
+
+    // Create board
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/boards")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"slug": "media", "name": "Media"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let img_bytes = b"\xff\xd8\xff\xe0fake-jpeg-bytes";
+    let audio_bytes = b"\x00\x00\x00\x18ftypM4A fake-m4a-bytes";
+    let txt_bytes = b"hello multimodal world\nline 2";
+    let vid_bytes = b"\x00\x00\x00\x18ftypmp42\xff\xfe\x80\x81fake-mp4-bytes";
+
+    let img_id = upload_test_file(&app, &admin_auth, "capture.jpg", "image/jpeg", img_bytes).await;
+    let audio_id = upload_test_file(&app, &admin_auth, "memo.m4a", "audio/mp4", audio_bytes).await;
+    let txt_id = upload_test_file(&app, &admin_auth, "notes.txt", "text/plain; charset=utf-8", txt_bytes).await;
+    let vid_id = upload_test_file(&app, &admin_auth, "clip.mp4", "video/mp4", vid_bytes).await;
+
+    // Create thread with explicit attachment_ids + file:// body reference + nonexistent UUID
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/boards/media/threads")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "Media Thread",
+                        "body": format!("See audio file://{audio_id} and missing file://00000000-0000-0000-0000-000000000000"),
+                        "attachment_ids": [img_id]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created_thread = body_json(resp).await;
+    let tid = created_thread["id"].as_str().unwrap().to_string();
+    let t_atts = created_thread["attachments"].as_array().unwrap();
+    assert_eq!(t_atts.len(), 2);
+    let t_att_ids: Vec<&str> = t_atts.iter().map(|a| a["id"].as_str().unwrap()).collect();
+    assert!(t_att_ids.contains(&img_id.as_str()));
+    assert!(t_att_ids.contains(&audio_id.as_str()));
+
+    // ThreadSummary in GET /api/v1/boards/media/threads includes attachments
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/boards/media/threads")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list_json = body_json(resp).await;
+    assert_eq!(list_json["threads"][0]["attachments"].as_array().unwrap().len(), 2);
+
+    // Create post via MCP with /api/v1/files/<txt_id> in body and attachment_ids: [vid_id]
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 10,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "create_post",
+                            "arguments": {
+                                "thread_id": tid,
+                                "body": format!("Attached notes at /api/v1/files/{txt_id}"),
+                                "attachment_ids": [vid_id]
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mcp_post = body_json(resp).await;
+    assert_eq!(mcp_post["result"]["isError"], false);
+
+    // GET /api/v1/threads/{tid} returns attachments on both thread and post
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/threads/{tid}"))
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = body_json(resp).await;
+    assert_eq!(detail["thread"]["attachments"].as_array().unwrap().len(), 2);
+    let p_atts = detail["posts"][0]["attachments"].as_array().unwrap();
+    assert_eq!(p_atts.len(), 2);
+    let p_att_ids: Vec<&str> = p_atts.iter().map(|a| a["id"].as_str().unwrap()).collect();
+    assert!(p_att_ids.contains(&txt_id.as_str()));
+    assert!(p_att_ids.contains(&vid_id.as_str()));
+
+    // MCP read_file on image
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 11,
+                        "method": "tools/call",
+                        "params": { "name": "read_file", "arguments": { "file_id": img_id } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let img_res = body_json(resp).await;
+    assert_eq!(img_res["result"]["isError"], false);
+    assert_eq!(img_res["result"]["content"][0]["type"], "image");
+    assert_eq!(img_res["result"]["content"][0]["mimeType"], "image/jpeg");
+    assert_eq!(
+        img_res["result"]["content"][0]["data"],
+        BASE64_STANDARD.encode(img_bytes)
+    );
+    assert_eq!(img_res["result"]["content"][1]["type"], "text");
+
+    // MCP read_file on audio
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 12,
+                        "method": "tools/call",
+                        "params": { "name": "read_file", "arguments": { "file_id": audio_id } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let audio_res = body_json(resp).await;
+    assert_eq!(audio_res["result"]["isError"], false);
+    assert_eq!(audio_res["result"]["content"][0]["type"], "audio");
+    assert_eq!(audio_res["result"]["content"][0]["mimeType"], "audio/mp4");
+    assert_eq!(
+        audio_res["result"]["content"][0]["data"],
+        BASE64_STANDARD.encode(audio_bytes)
+    );
+    assert_eq!(audio_res["result"]["content"][1]["type"], "text");
+
+    // MCP read_file on text
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 13,
+                        "method": "tools/call",
+                        "params": { "name": "read_file", "arguments": { "file_id": txt_id } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let txt_res = body_json(resp).await;
+    assert_eq!(txt_res["result"]["isError"], false);
+    assert_eq!(txt_res["result"]["content"][0]["type"], "text");
+    assert_eq!(
+        txt_res["result"]["content"][0]["text"],
+        "hello multimodal world\nline 2"
+    );
+
+    // MCP read_file on video/binary falls back to metadata + download_path
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 14,
+                        "method": "tools/call",
+                        "params": { "name": "read_file", "arguments": { "file_id": vid_id } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let vid_res = body_json(resp).await;
+    assert_eq!(vid_res["result"]["isError"], false);
+    assert_eq!(vid_res["result"]["content"][0]["type"], "text");
+    let vid_meta: Value =
+        serde_json::from_str(vid_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(vid_meta["download_path"], format!("/api/v1/files/{vid_id}"));
 }

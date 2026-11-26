@@ -1,7 +1,7 @@
 use crate::{
     auth::AuthAgent,
     db::{record_event, upsert_search_index},
-    routes::pings::auto_ping_mentions,
+    routes::{files::FileMeta, pings::auto_ping_mentions},
     AppState,
 };
 use axum::{
@@ -11,6 +11,8 @@ use axum::{
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -35,6 +37,8 @@ pub struct ThreadSummary {
     pub created_at: String,
     pub updated_at: String,
     pub post_count: i64,
+    #[sqlx(skip)]
+    pub attachments: Vec<FileMeta>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -48,6 +52,8 @@ pub struct ThreadDetail {
     pub pinned: i64,
     pub created_at: String,
     pub updated_at: String,
+    #[sqlx(skip)]
+    pub attachments: Vec<FileMeta>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -58,6 +64,8 @@ pub struct Post {
     pub author_name: String,
     pub body: String,
     pub created_at: String,
+    #[sqlx(skip)]
+    pub attachments: Vec<FileMeta>,
 }
 
 #[derive(Deserialize)]
@@ -74,11 +82,135 @@ pub struct CreateThreadReq {
     pub body: String,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub attachment_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
 pub struct CreatePostReq {
     pub body: String,
+    #[serde(default)]
+    pub attachment_ids: Vec<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AttachmentRow {
+    target_id: String,
+    id: String,
+    filename: String,
+    content_type: String,
+    size_bytes: i64,
+    sha256: String,
+    uploaded_by_id: String,
+    uploaded_by_name: String,
+    created_at: String,
+}
+
+fn extract_uuids_after_prefix(body: &str, prefix: &str, out: &mut Vec<String>) {
+    let mut rest = body;
+    while let Some(idx) = rest.find(prefix) {
+        let after = &rest[idx + prefix.len()..];
+        if after.len() >= 36 && after.is_char_boundary(36) {
+            if let Ok(u) = Uuid::parse_str(&after[..36]) {
+                out.push(u.to_string());
+            }
+        }
+        rest = &rest[idx + prefix.len()..];
+    }
+}
+
+pub fn extract_file_ids_from_body(body: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    extract_uuids_after_prefix(body, "file://", &mut ids);
+    extract_uuids_after_prefix(body, "/api/v1/files/", &mut ids);
+    ids
+}
+
+pub async fn link_attachments(
+    pool: &SqlitePool,
+    target_kind: &str,
+    target_id: &str,
+    explicit_ids: &[String],
+    body: &str,
+) -> Vec<FileMeta> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for raw in explicit_ids {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            candidates.push(trimmed.to_string());
+        }
+    }
+    for extracted in extract_file_ids_from_body(body) {
+        if seen.insert(extracted.clone()) {
+            candidates.push(extracted);
+        }
+    }
+
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    for file_id in &candidates {
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO attachments (target_kind, target_id, file_id, created_at) SELECT ?, ?, id, ? FROM files WHERE id = ?",
+        )
+        .bind(target_kind)
+        .bind(target_id)
+        .bind(&now)
+        .bind(file_id)
+        .execute(pool)
+        .await;
+    }
+
+    let mut map = fetch_attachments_for_targets(pool, target_kind, &[target_id.to_string()]).await;
+    map.remove(target_id).unwrap_or_default()
+}
+
+pub async fn fetch_attachments_for_targets(
+    pool: &SqlitePool,
+    target_kind: &str,
+    target_ids: &[String],
+) -> HashMap<String, Vec<FileMeta>> {
+    let mut map: HashMap<String, Vec<FileMeta>> = HashMap::new();
+    if target_ids.is_empty() {
+        return map;
+    }
+
+    let placeholders = vec!["?"; target_ids.len()].join(", ");
+    let sql = format!(
+        r#"
+        SELECT a.target_id, f.id, f.filename, f.content_type, f.size_bytes, f.sha256,
+               f.uploaded_by_id, f.uploaded_by_name, f.created_at
+        FROM attachments a
+        JOIN files f ON f.id = a.file_id
+        WHERE a.target_kind = ? AND a.target_id IN ({placeholders})
+        ORDER BY a.created_at ASC, f.created_at ASC
+        "#
+    );
+
+    let mut q = sqlx::query_as::<_, AttachmentRow>(&sql).bind(target_kind);
+    for id in target_ids {
+        q = q.bind(id);
+    }
+
+    let rows = q.fetch_all(pool).await.unwrap_or_default();
+    for r in rows {
+        map.entry(r.target_id).or_default().push(FileMeta {
+            id: r.id,
+            filename: r.filename,
+            content_type: r.content_type,
+            size_bytes: r.size_bytes,
+            sha256: r.sha256,
+            uploaded_by_id: r.uploaded_by_id,
+            uploaded_by_name: r.uploaded_by_name,
+            created_at: r.created_at,
+        });
+    }
+
+    map
 }
 
 pub async fn list_boards(State(state): State<AppState>) -> impl IntoResponse {
@@ -193,11 +325,18 @@ pub async fn list_threads(
     .await;
 
     match threads {
-        Ok(threads) => Json(serde_json::json!({
-            "board": { "id": board_id, "slug": b_slug, "name": b_name, "description": b_desc },
-            "threads": threads
-        }))
-        .into_response(),
+        Ok(mut threads) => {
+            let thread_ids: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
+            let mut att_map = fetch_attachments_for_targets(&state.pool, "thread", &thread_ids).await;
+            for t in &mut threads {
+                t.attachments = att_map.remove(&t.id).unwrap_or_default();
+            }
+            Json(serde_json::json!({
+                "board": { "id": board_id, "slug": b_slug, "name": b_name, "description": b_desc },
+                "threads": threads
+            }))
+            .into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "db_error" }))).into_response(),
     }
 }
@@ -245,6 +384,8 @@ pub async fn create_thread(
 
     match res {
         Ok(_) => {
+            let attachments =
+                link_attachments(&state.pool, "thread", &id, &req.attachment_ids, &body).await;
             let _ = upsert_search_index(&state.pool, "thread", &id, &slug, &title, &body).await;
             let _ = record_event(
                 &state.pool,
@@ -270,7 +411,8 @@ pub async fn create_thread(
                     "body": body,
                     "pinned": pinned,
                     "created_at": now,
-                    "updated_at": now
+                    "updated_at": now,
+                    "attachments": attachments
                 })),
             )
                 .into_response()
@@ -291,17 +433,26 @@ pub async fn get_thread(
     .await
     .unwrap_or(None);
 
-    let Some(thread) = thread else {
+    let Some(mut thread) = thread else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "thread_not_found" }))).into_response();
     };
 
-    let posts: Vec<Post> = sqlx::query_as(
+    let mut posts: Vec<Post> = sqlx::query_as(
         "SELECT id, thread_id, author_id, author_name, body, created_at FROM posts WHERE thread_id = ? ORDER BY created_at ASC",
     )
     .bind(&id)
     .fetch_all(&state.pool)
     .await
     .unwrap_or_default();
+
+    let mut thread_att = fetch_attachments_for_targets(&state.pool, "thread", &[thread.id.clone()]).await;
+    thread.attachments = thread_att.remove(&thread.id).unwrap_or_default();
+
+    let post_ids: Vec<String> = posts.iter().map(|p| p.id.clone()).collect();
+    let mut post_att = fetch_attachments_for_targets(&state.pool, "post", &post_ids).await;
+    for p in &mut posts {
+        p.attachments = post_att.remove(&p.id).unwrap_or_default();
+    }
 
     Json(serde_json::json!({ "thread": thread, "posts": posts })).into_response()
 }
@@ -345,6 +496,8 @@ pub async fn create_post(
 
     match res {
         Ok(_) => {
+            let attachments =
+                link_attachments(&state.pool, "post", &id, &req.attachment_ids, &body).await;
             let _ = sqlx::query("UPDATE threads SET updated_at = ? WHERE id = ?")
                 .bind(&now)
                 .bind(&thread_id)
@@ -372,7 +525,8 @@ pub async fn create_post(
                     "author_id": agent.agent_id,
                     "author_name": agent.name,
                     "body": body,
-                    "created_at": now
+                    "created_at": now,
+                    "attachments": attachments
                 })),
             )
                 .into_response()

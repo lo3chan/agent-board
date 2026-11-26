@@ -172,6 +172,14 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
         CREATE INDEX IF NOT EXISTS idx_pings_to_acked_created
             ON pings(to_id, acked_at, created_at);
+
+        CREATE TABLE IF NOT EXISTS attachments (
+            target_kind TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (target_kind, target_id, file_id)
+        );
         "#,
     )
     .execute(pool)
