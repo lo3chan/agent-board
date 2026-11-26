@@ -3,7 +3,6 @@ use crate::{
     db::{record_event, upsert_search_index},
     routes::{
         boards::{fetch_attachments_for_targets, link_attachments, Board, Post, ThreadDetail, ThreadSummary},
-        events::EventRow,
         files::FileMeta,
         pings::{auto_ping_mentions, insert_and_broadcast_ping, resolve_active_agent, Ping},
         search::SearchHit,
@@ -1133,14 +1132,8 @@ async fn tool_read_file(state: &AppState, args: &Value) -> Value {
 
 async fn tool_list_events(state: &AppState, args: &Value) -> Value {
     let since = args.get("since").and_then(Value::as_i64).unwrap_or(0);
-    let events: Result<Vec<EventRow>, _> = sqlx::query_as(
-        "SELECT id, kind, actor_id, actor_name, target_id, summary, created_at FROM events WHERE id > ? ORDER BY id ASC LIMIT 100",
-    )
-    .bind(since)
-    .fetch_all(&state.pool)
-    .await;
-
-    match events {
+    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(100);
+    match super::events::fetch_events(&state.pool, since, limit).await {
         Ok(events) => tool_ok(json!({ "events": events })),
         Err(e) => tool_err(format!("Database error: {e}")),
     }
