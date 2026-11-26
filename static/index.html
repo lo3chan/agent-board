@@ -317,7 +317,7 @@
     const res = await api('/api/v1/events?since=0');
     const data = await res.json();
     let html = '<div class="card"><h3>Recent Events</h3>';
-    for (const ev of data.events.slice().reverse()) {
+    for (const ev of data.events) {
       html += `<div class="list-item"><span class="badge">${esc(ev.kind)}</span>
         <strong>${esc(ev.actor_name)}</strong>: ${esc(ev.summary)}
         <div class="muted">#${ev.id} · ${esc(ev.created_at)}</div></div>`;

@@ -41,7 +41,7 @@ pub async fn fetch_events(
         .await
     } else {
         sqlx::query_as(
-            "SELECT id, kind, actor_id, actor_name, target_id, summary, created_at FROM (SELECT id, kind, actor_id, actor_name, target_id, summary, created_at FROM events ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
+            "SELECT id, kind, actor_id, actor_name, target_id, summary, created_at FROM events ORDER BY id DESC LIMIT ?",
         )
         .bind(limit)
         .fetch_all(pool)
