@@ -1,4 +1,4 @@
-use agent_board::{build_app, db::init_db, AppState};
+use agent_board::{build_app, build_http_client, db::init_db, AppState};
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -20,6 +20,7 @@ async fn setup_app() -> (Router, TempDir) {
         pool,
         data_dir: dir.path().to_path_buf(),
         tx,
+        http_client: build_http_client(),
     };
     (build_app(state), dir)
 }
@@ -726,7 +727,7 @@ async fn oauth_discovery_dcr_pkce_and_mcp_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let list_resp = body_json(resp).await;
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18);
+    assert_eq!(tools.len(), 20);
 
     // Call `me` tool -> resolves to Gemini identity
     let resp = app
@@ -1185,7 +1186,7 @@ async fn pings_mentions_sse_and_mcp_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let tools_resp = body_json(resp).await;
     let tools = tools_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18);
+    assert_eq!(tools.len(), 20);
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"ping_agent"));
     assert!(names.contains(&"list_pings"));
@@ -1586,4 +1587,330 @@ async fn attachments_and_multimodal_read_file_flow() {
     let vid_meta: Value =
         serde_json::from_str(vid_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(vid_meta["download_path"], format!("/api/v1/files/{vid_id}"));
+}
+
+#[tokio::test]
+async fn tool_registry_proxy_and_mcp_tools() {
+    use axum::{
+        extract::Path as AxumPath,
+        http::HeaderMap,
+        routing::patch,
+        Json as AxumJson,
+    };
+
+    let (app, _dir) = setup_app().await;
+    let admin_auth = format!("Bearer {BOOTSTRAP_ADMIN}");
+
+    // Mint an agent token
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/tokens")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"name": "tool-tester", "role": "agent"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let agent_token = body_json(resp).await["token"].as_str().unwrap().to_string();
+    let agent_auth = format!("Bearer {agent_token}");
+
+    // Start local mock Axum HTTP server
+    let mock_router = Router::new().route(
+        "/items/{id}",
+        patch(
+            |AxumPath(id): AxumPath<String>,
+             headers: HeaderMap,
+             AxumJson(body): AxumJson<Value>| async move {
+                let secret = headers
+                    .get("x-internal-secret")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                AxumJson(json!({
+                    "echo_id": id,
+                    "echo_secret": secret,
+                    "echo_body": body
+                }))
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_router).await.unwrap();
+    });
+
+    // Agent cannot register tools (403)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/tools")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "mock.patch_item",
+                        "description": "Patch an item",
+                        "method": "PATCH",
+                        "url_template": format!("http://{addr}/items/{{id}}")
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Admin registers public tool + admin-only tool
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/tools")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "mock.patch_item",
+                        "description": "Patch an item on mock server",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": { "id": { "type": "string" }, "title": { "type": "string" } },
+                            "required": ["id"]
+                        },
+                        "method": "PATCH",
+                        "url_template": format!("http://{addr}/items/{{id}}"),
+                        "headers": { "X-Internal-Secret": "super-secret-123" },
+                        "allowed_roles": "all"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/tools")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "mock.admin_only",
+                        "description": "Admin only tool",
+                        "method": "GET",
+                        "url_template": format!("http://{addr}/items/admin"),
+                        "allowed_roles": "admin"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // GET /api/v1/tools hides headers_json & url_template, and filters admin tools for agents
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/tools")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tools_json = body_json(resp).await;
+    let tools_arr = tools_json["tools"].as_array().unwrap();
+    assert_eq!(tools_arr.len(), 1);
+    assert_eq!(tools_arr[0]["name"], "mock.patch_item");
+    assert!(tools_arr[0].get("headers_json").is_none());
+    assert!(tools_arr[0].get("headers").is_none());
+    assert!(tools_arr[0].get("url_template").is_none());
+
+    // Agent cannot call admin-only tool (403)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/mock.admin_only")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // POST /api/v1/tools/mock.patch_item substitutes {id}, sends secret header + remaining JSON body
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/mock.patch_item")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "id": "42", "title": "Updated Title" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let call_res = body_json(resp).await;
+    assert_eq!(call_res["ok"], true);
+    assert_eq!(call_res["status"], 200);
+    assert_eq!(call_res["result"]["echo_id"], "42");
+    assert_eq!(call_res["result"]["echo_secret"], "super-secret-123");
+    assert_eq!(call_res["result"]["echo_body"], json!({ "title": "Updated Title" }));
+
+    // Verify tool.called event was recorded
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events_json = body_json(resp).await;
+    let events = events_json["events"].as_array().unwrap();
+    assert!(events.iter().any(|e| {
+        e["kind"] == "tool.called" && e["target_id"] == "mock.patch_item"
+    }));
+
+    // MCP tools/list has 20 tools
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 100,
+                        "method": "tools/list",
+                        "params": {}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mcp_list = body_json(resp).await;
+    assert_eq!(mcp_list["result"]["tools"].as_array().unwrap().len(), 20);
+
+    // MCP list_tools
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 101,
+                        "method": "tools/call",
+                        "params": { "name": "list_tools", "arguments": {} }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mcp_tools_res = body_json(resp).await;
+    assert_eq!(mcp_tools_res["result"]["isError"], false);
+    let parsed_list: Value = serde_json::from_str(
+        mcp_tools_res["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(parsed_list["tools"].as_array().unwrap().len(), 1);
+
+    // MCP call_tool
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 102,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "call_tool",
+                            "arguments": {
+                                "name": "mock.patch_item",
+                                "args": { "id": "99", "title": "Via MCP" }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mcp_call_res = body_json(resp).await;
+    assert_eq!(mcp_call_res["result"]["isError"], false);
+    let parsed_call: Value = serde_json::from_str(
+        mcp_call_res["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(parsed_call["ok"], true);
+    assert_eq!(parsed_call["status"], 200);
+    assert_eq!(parsed_call["result"]["echo_id"], "99");
+    assert_eq!(parsed_call["result"]["echo_secret"], "super-secret-123");
+    assert_eq!(parsed_call["result"]["echo_body"], json!({ "title": "Via MCP" }));
+
+    // Admin can delete tool
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/v1/admin/tools/mock.admin_only")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

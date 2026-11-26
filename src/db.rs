@@ -180,6 +180,20 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             created_at TEXT NOT NULL,
             PRIMARY KEY (target_kind, target_id, file_id)
         );
+
+        CREATE TABLE IF NOT EXISTS tools (
+            name TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            input_schema TEXT NOT NULL,
+            method TEXT NOT NULL,
+            url_template TEXT NOT NULL,
+            headers_json TEXT NOT NULL DEFAULT '{}',
+            allowed_roles TEXT NOT NULL DEFAULT 'all',
+            created_by_id TEXT NOT NULL,
+            created_by_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         "#,
     )
     .execute(pool)
@@ -274,6 +288,63 @@ pub async fn upsert_search_index(
         .bind(body)
         .execute(pool)
         .await?;
+
+    Ok(())
+}
+
+/// Idempotently seeds the 18 `gettysburg-beacon` bridge tools when `BEACON_INTERNAL_URL` is configured.
+pub async fn seed_beacon_tools(pool: &SqlitePool, beacon_url: &str) -> Result<(), sqlx::Error> {
+    let base = beacon_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let headers_json = r#"{"Host":"edit.gettysburgbeacon.com"}"#;
+    let schema_empty = r#"{"type":"object","properties":{}}"#;
+    let schema_id = r#"{"type":"object","properties":{"id":{"type":"string","description":"Resource ID"}},"required":["id"]}"#;
+
+    let tools: [(&str, &str, &str, &str, &str); 18] = [
+        ("beacon.manifest", "Get gettysburg-beacon agent API manifest.", schema_empty, "GET", "/api/agent"),
+        ("beacon.get_site", "Get gettysburg-beacon site configuration and metadata.", schema_empty, "GET", "/api/agent/site"),
+        ("beacon.list_dispatches", "List all dispatches on gettysburg-beacon.", schema_empty, "GET", "/api/agent/dispatches"),
+        ("beacon.create_dispatch", "Create a new dispatch on gettysburg-beacon.", schema_empty, "POST", "/api/agent/dispatches"),
+        ("beacon.update_dispatch", "Update an existing dispatch on gettysburg-beacon.", schema_id, "PATCH", "/api/agent/dispatches/{id}"),
+        ("beacon.delete_dispatch", "Delete a dispatch on gettysburg-beacon.", schema_id, "DELETE", "/api/agent/dispatches/{id}"),
+        ("beacon.list_panels", "List all panels on gettysburg-beacon.", schema_empty, "GET", "/api/agent/panels"),
+        ("beacon.create_panel", "Create a new panel on gettysburg-beacon.", schema_empty, "POST", "/api/agent/panels"),
+        ("beacon.update_panel", "Update an existing panel on gettysburg-beacon.", schema_id, "PATCH", "/api/agent/panels/{id}"),
+        ("beacon.delete_panel", "Delete a panel on gettysburg-beacon.", schema_id, "DELETE", "/api/agent/panels/{id}"),
+        ("beacon.reorder_panels", "Reorder panels on gettysburg-beacon.", schema_empty, "PUT", "/api/agent/panels/reorder"),
+        ("beacon.list_feeds", "List all feeds on gettysburg-beacon.", schema_empty, "GET", "/api/agent/feeds"),
+        ("beacon.add_feed", "Add a new feed on gettysburg-beacon.", schema_empty, "POST", "/api/agent/feeds"),
+        ("beacon.update_feed", "Update an existing feed on gettysburg-beacon.", schema_id, "PATCH", "/api/agent/feeds/{id}"),
+        ("beacon.delete_feed", "Delete a feed on gettysburg-beacon.", schema_id, "DELETE", "/api/agent/feeds/{id}"),
+        ("beacon.refresh_feeds", "Refresh all feeds on gettysburg-beacon.", schema_empty, "POST", "/api/agent/feeds/refresh"),
+        ("beacon.get_about", "Get the About section on gettysburg-beacon.", schema_empty, "GET", "/api/agent/about"),
+        ("beacon.update_about", "Update the About section on gettysburg-beacon.", schema_empty, "PATCH", "/api/agent/about"),
+    ];
+
+    for (name, description, input_schema, method, path) in tools {
+        let url_template = format!("{base}{path}");
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO tools
+                (name, description, input_schema, method, url_template, headers_json, allowed_roles, created_by_id, created_by_name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'all', 'system', 'system', ?, ?)
+            "#,
+        )
+        .bind(name)
+        .bind(description)
+        .bind(input_schema)
+        .bind(method)
+        .bind(&url_template)
+        .bind(headers_json)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
 
     Ok(())
 }

@@ -1,4 +1,8 @@
-use agent_board::{build_app, db::init_db, AppState};
+use agent_board::{
+    build_app, build_http_client,
+    db::{init_db, seed_beacon_tools},
+    AppState,
+};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -20,8 +24,24 @@ async fn main() {
         .await
         .expect("Failed to initialize SQLite database");
 
+    if let Ok(beacon_url) = std::env::var("BEACON_INTERNAL_URL") {
+        let trimmed = beacon_url.trim();
+        if !trimmed.is_empty() {
+            seed_beacon_tools(&pool, trimmed)
+                .await
+                .expect("Failed to seed beacon tools");
+            tracing::info!("Seeded gettysburg-beacon tools for {trimmed}");
+        }
+    }
+
     let (tx, _) = tokio::sync::broadcast::channel(256);
-    let state = AppState { pool, data_dir, tx };
+    let http_client = build_http_client();
+    let state = AppState {
+        pool,
+        data_dir,
+        tx,
+        http_client,
+    };
     let app = build_app(state);
 
     let port: u16 = std::env::var("PORT")

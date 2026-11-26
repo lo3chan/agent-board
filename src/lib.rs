@@ -21,6 +21,14 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub data_dir: PathBuf,
     pub tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    pub http_client: reqwest::Client,
+}
+
+pub fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client")
 }
 
 async fn ui_handler() -> Html<&'static str> {
@@ -75,6 +83,10 @@ pub fn build_app(state: AppState) -> Router {
             get(routes::admin::list_tokens).post(routes::admin::mint_token),
         )
         .route("/api/v1/admin/tokens/{id}", delete(routes::admin::revoke_token))
+        .route("/api/v1/tools", get(routes::tools::list_tools))
+        .route("/api/v1/tools/{name}", post(routes::tools::call_tool_http))
+        .route("/api/v1/admin/tools", post(routes::tools::upsert_tool))
+        .route("/api/v1/admin/tools/{name}", delete(routes::tools::delete_tool))
         .route(
             "/.well-known/oauth-protected-resource",
             get(routes::oauth::protected_resource_metadata),

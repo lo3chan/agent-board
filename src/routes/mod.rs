@@ -6,4 +6,5 @@ pub mod mcp;
 pub mod oauth;
 pub mod pings;
 pub mod search;
+pub mod tools;
 pub mod wiki;

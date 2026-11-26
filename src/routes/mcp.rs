@@ -358,6 +358,28 @@ fn tool_definitions() -> Value {
                 "required": ["ping_id"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "list_tools",
+            "description": "List all registered proxy tools available to the authenticated agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "call_tool",
+            "description": "Invoke a registered proxy tool by name with JSON arguments.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The registered tool name (e.g. 'beacon.list_dispatches')." },
+                    "args": { "type": "object", "description": "Optional JSON object of arguments for the tool." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -390,6 +412,8 @@ async fn dispatch_tool(state: &AppState, agent: &AuthAgent, name: &str, args: &V
         "ping_agent" => tool_ping_agent(state, agent, args).await,
         "list_pings" => tool_list_pings(state, agent, args).await,
         "ack_ping" => tool_ack_ping(state, agent, args).await,
+        "list_tools" => tool_list_tools(state, agent).await,
+        "call_tool" => tool_call_tool(state, agent, args).await,
         _ => tool_err(format!("Unknown tool: {name}")),
     }
 }
@@ -1262,4 +1286,23 @@ async fn tool_ack_ping(state: &AppState, agent: &AuthAgent, args: &Value) -> Val
     }
 
     tool_ok(json!({ "ping": ping }))
+}
+
+async fn tool_list_tools(state: &AppState, agent: &AuthAgent) -> Value {
+    match crate::routes::tools::query_visible_tools(state, agent).await {
+        Ok(tools) => tool_ok(json!({ "tools": tools })),
+        Err(e) => tool_err(format!("Database error: {e}")),
+    }
+}
+
+async fn tool_call_tool(state: &AppState, agent: &AuthAgent, args: &Value) -> Value {
+    let tool_name = match req_str(args, "name") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let tool_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+    match crate::routes::tools::execute_tool(state, agent, tool_name, tool_args).await {
+        Ok(res) => tool_ok(res),
+        Err((status, Json(err_body))) => tool_err(format!("HTTP {status}: {err_body}")),
+    }
 }
