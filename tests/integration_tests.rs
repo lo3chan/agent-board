@@ -1914,3 +1914,220 @@ async fn tool_registry_proxy_and_mcp_tools() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn tool_guardrails_protect_self_and_require_confirm() {
+    use axum::{
+        extract::{Path as AxumPath, RawQuery},
+        routing::{delete, post, put},
+        Json as AxumJson,
+    };
+
+    let (app, _dir) = setup_app().await;
+    let admin_auth = format!("Bearer {BOOTSTRAP_ADMIN}");
+
+    let mock_router = Router::new()
+        .route(
+            "/stacks/{stack_id}",
+            put(|AxumPath(stack_id): AxumPath<String>| async move {
+                AxumJson(json!({ "updated_stack": stack_id }))
+            }),
+        )
+        .route(
+            "/containers/{container_id}/restart",
+            post(|AxumPath(container_id): AxumPath<String>| async move {
+                AxumJson(json!({ "restarted": container_id }))
+            }),
+        )
+        .route(
+            "/dns/{record_id}",
+            delete(
+                |AxumPath(record_id): AxumPath<String>, RawQuery(query): RawQuery| async move {
+                    AxumJson(json!({
+                        "deleted_record": record_id,
+                        "raw_query": query.unwrap_or_default()
+                    }))
+                },
+            ),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_router).await.unwrap();
+    });
+
+    for (name, method, url_template) in [
+        (
+            "portainer.update_stack",
+            "PUT",
+            format!("http://{addr}/stacks/{{stack_id}}"),
+        ),
+        (
+            "portainer.container_action",
+            "POST",
+            format!("http://{addr}/containers/{{container_id}}/restart"),
+        ),
+        (
+            "cloudflare.delete_dns_record",
+            "DELETE",
+            format!("http://{addr}/dns/{{record_id}}"),
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/admin/tools")
+                    .header(header::AUTHORIZATION, &admin_auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": name,
+                            "description": name,
+                            "method": method,
+                            "url_template": url_template,
+                            "allowed_roles": "all"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // portainer.update_stack on stack 133 or 66 returns 403
+    for protected_id in [json!(133), json!(66), json!("133"), json!("66")] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/tools/portainer.update_stack")
+                    .header(header::AUTHORIZATION, &admin_auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "stack_id": protected_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "protected_resource");
+    }
+
+    // portainer.update_stack on non-protected stack (e.g. itso endpoint 9, stack 105) succeeds
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/portainer.update_stack")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "stack_id": 105, "endpoint_id": 9 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // portainer.container_action on agent-board or portainer-server returns 403
+    for container in ["agent-board", "portainer-server-1"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/tools/portainer.container_action")
+                    .header(header::AUTHORIZATION, &admin_auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "container_id": container }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // cloudflare.delete_dns_record without confirm: true returns 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/cloudflare.delete_dns_record")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "record_id": "other-record-123" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"], "confirmation_required");
+
+    // cloudflare.delete_dns_record on protected record returns 403
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/cloudflare.delete_dns_record")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "record_id": "58f63ef53ccbb46b4849b01883ba385a",
+                        "confirm": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_json(resp).await;
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"], "protected_resource");
+
+    // cloudflare.delete_dns_record on another record with confirm: true succeeds and strips confirm
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/cloudflare.delete_dns_record")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "record_id": "other-record-123",
+                        "confirm": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["result"]["deleted_record"], "other-record-123");
+    assert!(!body["result"]["raw_query"]
+        .as_str()
+        .unwrap()
+        .contains("confirm"));
+}

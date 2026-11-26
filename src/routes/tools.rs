@@ -46,6 +46,124 @@ fn err_resp(status: StatusCode, code: &str, detail: impl Into<String>) -> (Statu
     )
 }
 
+fn guardrail_err(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<Value>) {
+    (
+        status,
+        Json(json!({ "ok": false, "error": code, "message": message.into() })),
+    )
+}
+
+fn arg_str(args: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| args.get(*k).and_then(primitive_to_string))
+        .map(|s| s.trim().to_ascii_lowercase())
+}
+
+fn enforce_tool_guardrails(
+    name: &str,
+    args: &mut Map<String, Value>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    const PROTECTED_RECORD_ID: &str = "58f63ef53ccbb46b4849b01883ba385a";
+    const PROTECTED_HOSTNAME: &str = "board.gettysburgbeacon.com";
+    const PROTECTED_TUNNEL_ID: &str = "1d15767c-7bfd-41a3-81a0-103a5ea3be9d";
+
+    match name {
+        "portainer.update_stack" | "portainer.redeploy_git_stack" => {
+            if let Some(target) = arg_str(
+                args,
+                &["stack_id", "stackId", "id", "name", "stack_name", "stackName"],
+            ) {
+                if target == "133"
+                    || target == "66"
+                    || target.contains("agent-board")
+                    || target.contains("portainer-server")
+                {
+                    return Err(guardrail_err(
+                        StatusCode::FORBIDDEN,
+                        "protected_resource",
+                        format!("Refusing to mutate protected Portainer stack '{target}'"),
+                    ));
+                }
+            }
+        }
+        "portainer.container_action" => {
+            if let Some(target) = arg_str(
+                args,
+                &[
+                    "container_id",
+                    "containerId",
+                    "container",
+                    "id",
+                    "name",
+                    "container_name",
+                    "containerName",
+                ],
+            ) {
+                if target.contains("agent-board") || target.contains("portainer-server") {
+                    return Err(guardrail_err(
+                        StatusCode::FORBIDDEN,
+                        "protected_resource",
+                        format!("Refusing to mutate protected Portainer container '{target}'"),
+                    ));
+                }
+            }
+        }
+        "cloudflare.update_dns_record"
+        | "cloudflare.delete_dns_record"
+        | "cloudflare.update_tunnel_ingress"
+        | "cloudflare.delete_tunnel" => {
+            if let Some(rec_id) = arg_str(args, &["record_id", "id"]) {
+                if rec_id == PROTECTED_RECORD_ID {
+                    return Err(guardrail_err(
+                        StatusCode::FORBIDDEN,
+                        "protected_resource",
+                        "Refusing to mutate protected Cloudflare DNS record for board.gettysburgbeacon.com",
+                    ));
+                }
+            }
+            if let Some(rec_name) = arg_str(args, &["name", "hostname"]) {
+                if rec_name == PROTECTED_HOSTNAME {
+                    return Err(guardrail_err(
+                        StatusCode::FORBIDDEN,
+                        "protected_resource",
+                        "Refusing to mutate protected Cloudflare DNS name 'board.gettysburgbeacon.com'",
+                    ));
+                }
+            }
+            if let Some(tun_id) = arg_str(args, &["tunnel_id", "id"]) {
+                if tun_id == PROTECTED_TUNNEL_ID {
+                    return Err(guardrail_err(
+                        StatusCode::FORBIDDEN,
+                        "protected_resource",
+                        "Refusing to mutate protected Cloudflare tunnel for agent-board",
+                    ));
+                }
+            }
+
+            if matches!(
+                name,
+                "cloudflare.delete_dns_record" | "cloudflare.delete_tunnel"
+            ) {
+                if args.get("confirm").and_then(Value::as_bool) != Some(true) {
+                    return Err(guardrail_err(
+                        StatusCode::BAD_REQUEST,
+                        "confirmation_required",
+                        "Pass confirm: true to delete a Cloudflare DNS record or tunnel",
+                    ));
+                }
+                args.remove("confirm");
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.as_bytes() {
@@ -198,6 +316,8 @@ pub async fn execute_tool(
             ))
         }
     };
+
+    enforce_tool_guardrails(&tool.name, &mut args_map)?;
 
     let url = substitute_url_template(&tool.url_template, &mut args_map)?;
     let method = reqwest::Method::from_bytes(tool.method.as_bytes()).map_err(|_| {
