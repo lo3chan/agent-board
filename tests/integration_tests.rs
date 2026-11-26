@@ -727,7 +727,7 @@ async fn oauth_discovery_dcr_pkce_and_mcp_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let list_resp = body_json(resp).await;
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 20);
+    assert_eq!(tools.len(), 26);
 
     // Call `me` tool -> resolves to Gemini identity
     let resp = app
@@ -1186,7 +1186,7 @@ async fn pings_mentions_sse_and_mcp_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let tools_resp = body_json(resp).await;
     let tools = tools_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 20);
+    assert_eq!(tools.len(), 26);
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"ping_agent"));
     assert!(names.contains(&"list_pings"));
@@ -1827,7 +1827,7 @@ async fn tool_registry_proxy_and_mcp_tools() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let mcp_list = body_json(resp).await;
-    assert_eq!(mcp_list["result"]["tools"].as_array().unwrap().len(), 20);
+    assert_eq!(mcp_list["result"]["tools"].as_array().unwrap().len(), 26);
 
     // MCP list_tools
     let resp = app
@@ -2370,4 +2370,333 @@ async fn list_threads_pagination_filtering_and_tool_actor_headers() {
     let body = body_json(resp).await;
     assert_eq!(body["result"]["actor"], "Antigravity");
     assert_eq!(body["result"]["role"], "admin");
+}
+
+#[tokio::test]
+async fn kanban_tickets_comments_and_mcp_flow() {
+    let (app, _dir) = setup_app().await;
+    let admin_auth = format!("Bearer {BOOTSTRAP_ADMIN}");
+
+    // Mint an agent token ("worker-k")
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/tokens")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"name": "worker-k", "role": "agent"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let agent_tok = body_json(resp).await["token"].as_str().unwrap().to_string();
+    let agent_auth = format!("Bearer {agent_tok}");
+
+    // 1. GET /api/v1/kanban returns 5 default columns
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/kanban")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let board = body_json(resp).await;
+    let cols = board["columns"].as_array().unwrap();
+    assert_eq!(cols.len(), 5);
+    assert_eq!(cols[0]["slug"], "backlog");
+    assert_eq!(cols[4]["slug"], "done");
+
+    // 2. Admin can create and delete a custom column; agent gets 403
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/kanban/columns")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"slug": "qa", "title": "QA"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/kanban/columns")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"slug": "qa", "title": "QA"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/v1/kanban/columns/qa")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 3. POST /api/v1/kanban/tickets creates ticket, indexes in search, pings assignee
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/kanban/tickets")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "Implement Kanban Board",
+                        "description": "Build Trello-style board for agents",
+                        "priority": "high",
+                        "labels": ["backend", "ui"],
+                        "assignee_name": "worker-k",
+                        "checklist": [{"text": "DB migration", "done": true}, {"text": "REST API", "done": false}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    let ticket_id = created["ticket"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["ticket"]["column_slug"], "todo");
+    assert_eq!(created["ticket"]["priority"], "high");
+    assert_eq!(created["ticket"]["labels"].as_array().unwrap().len(), 2);
+    assert_eq!(created["ticket"]["checklist"].as_array().unwrap().len(), 2);
+
+    // Search finds the ticket
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/search?q=Trello")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sres = body_json(resp).await;
+    assert_eq!(sres["results"][0]["kind"], "ticket");
+
+    // worker-k received an auto-ping for assignment
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pings?unread=true")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["pings"].as_array().unwrap().len(), 1);
+
+    // 4. PATCH /api/v1/kanban/tickets/{id} moves to in_progress
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/api/v1/kanban/tickets/{ticket_id}"))
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"column_slug": "in_progress", "priority": "urgent"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let patched = body_json(resp).await;
+    assert_eq!(patched["ticket"]["column_slug"], "in_progress");
+    assert_eq!(patched["ticket"]["priority"], "urgent");
+
+    // 5. POST /api/v1/kanban/tickets/{id}/comments
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/kanban/tickets/{ticket_id}/comments"))
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"body": "Working on it @Antigravity"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // GET /api/v1/kanban/tickets/{id} returns ticket + 1 comment
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/kanban/tickets/{ticket_id}"))
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = body_json(resp).await;
+    assert_eq!(detail["comments"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["ticket"]["comment_count"], 1);
+
+    // Non-creator agent cannot delete ticket (403)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/v1/kanban/tickets/{ticket_id}"))
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 6. MCP tools flow: kanban_board, kanban_create_ticket, kanban_get_ticket, kanban_update_ticket, kanban_add_comment, kanban_delete_ticket
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 10,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "kanban_create_ticket",
+                            "arguments": {
+                                "title": "MCP Created Ticket",
+                                "column_slug": "backlog",
+                                "priority": "low"
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mcp_create = body_json(resp).await;
+    assert_eq!(mcp_create["result"]["isError"], false);
+    let mcp_text = mcp_create["result"]["content"][0]["text"].as_str().unwrap();
+    let mcp_ticket: Value = serde_json::from_str(mcp_text).unwrap();
+    let mcp_ticket_id = mcp_ticket["ticket"]["id"].as_str().unwrap().to_string();
+
+    // kanban_board via MCP
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 11,
+                        "method": "tools/call",
+                        "params": { "name": "kanban_board", "arguments": { "column": "backlog" } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mcp_board_resp = body_json(resp).await;
+    let mcp_board: Value = serde_json::from_str(mcp_board_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mcp_board["tickets"].as_array().unwrap().len(), 1);
+
+    // kanban_update_ticket, kanban_add_comment, kanban_get_ticket, kanban_delete_ticket via MCP
+    for (rpc_id, tool_name, args) in [
+        (12, "kanban_update_ticket", json!({"ticket_id": mcp_ticket_id, "column_slug": "done"})),
+        (13, "kanban_add_comment", json!({"ticket_id": mcp_ticket_id, "body": "Done via MCP"})),
+        (14, "kanban_get_ticket", json!({"ticket_id": mcp_ticket_id})),
+        (15, "kanban_delete_ticket", json!({"ticket_id": mcp_ticket_id})),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::AUTHORIZATION, &agent_auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": rpc_id,
+                            "method": "tools/call",
+                            "params": { "name": tool_name, "arguments": args }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["result"]["isError"], false, "Tool {tool_name} failed: {v}");
+    }
+
+    // Admin deletes the first ticket
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/v1/kanban/tickets/{ticket_id}"))
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

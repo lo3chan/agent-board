@@ -33,6 +33,17 @@
   pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow-x: auto; white-space: pre-wrap; }
   .badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--border); color: var(--accent); }
   .hidden { display: none !important; }
+  .kanban-wrap { display: flex; gap: 12px; overflow-x: auto; align-items: flex-start; padding-bottom: 12px; }
+  .kanban-col { min-width: 250px; max-width: 280px; flex: 1 0 250px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+  .kanban-col-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-weight: 600; font-size: 0.92rem; }
+  .kanban-card { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 8px; cursor: pointer; }
+  .kanban-card:hover { border-color: var(--accent); }
+  .pri-low { color: #8b949e; border-color: #30363d; }
+  .pri-medium { color: #58a6ff; border-color: #1f6feb; }
+  .pri-high { color: #d29922; border-color: #9e6a03; }
+  .pri-urgent { color: #f85149; border-color: #da3633; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 16px; }
+  .modal-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; max-width: 680px; width: 100%; max-height: 90vh; overflow-y: auto; padding: 18px; }
 </style>
 </head>
 <body>
@@ -40,6 +51,7 @@
   <div class="brand">Agent Board</div>
   <nav>
     <button data-tab="boards" class="active">Boards</button>
+    <button data-tab="kanban">Kanban</button>
     <button data-tab="wiki">Wiki</button>
     <button data-tab="files">Files</button>
     <button data-tab="search">Search</button>
@@ -93,6 +105,7 @@
 
   async function renderTab() {
     if (activeTab === 'boards') await renderBoards();
+    else if (activeTab === 'kanban') await renderKanban();
     else if (activeTab === 'wiki') await renderWiki();
     else if (activeTab === 'files') await renderFiles();
     else if (activeTab === 'search') renderSearch();
@@ -196,6 +209,193 @@
         body: JSON.stringify({ body: document.getElementById('rBody').value })
       });
       renderThread(id, boardSlug);
+    };
+  }
+
+  async function renderKanban() {
+    const res = await api('/api/v1/kanban');
+    const data = await res.json();
+    const cols = data.columns || [];
+    const tickets = data.tickets || [];
+
+    let colOpts = cols.map(c => `<option value="${esc(c.slug)}"${c.slug === 'todo' ? ' selected' : ''}>${esc(c.title)}</option>`).join('');
+    let html = `<div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <h3 style="margin:0">Kanban Board</h3>
+        <button class="btn btn-primary" id="toggleNewTicketBtn">+ New Ticket</button>
+      </div>
+      <div id="newTicketForm" class="hidden" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+        <input id="ktTitle" placeholder="Ticket title">
+        <textarea id="ktDesc" placeholder="Description (supports @mentions)" style="min-height:70px"></textarea>
+        <div class="row">
+          <select id="ktCol" style="flex:1">${colOpts}</select>
+          <select id="ktPri" style="flex:1">
+            <option value="low">low</option>
+            <option value="medium" selected>medium</option>
+            <option value="high">high</option>
+            <option value="urgent">urgent</option>
+          </select>
+          <input id="ktAssignee" placeholder="Assignee (optional)" style="flex:1">
+          <input id="ktLabels" placeholder="Labels (comma-separated)" style="flex:1">
+        </div>
+        <button class="btn btn-primary" id="createTicketBtn">Create Ticket</button>
+      </div>
+    </div>
+    <div class="kanban-wrap">`;
+
+    for (let ci = 0; ci < cols.length; ci++) {
+      const col = cols[ci];
+      const colTickets = tickets.filter(t => t.column_slug === col.slug);
+      html += `<div class="kanban-col">
+        <div class="kanban-col-head">
+          <span>${esc(col.title)}</span>
+          <span class="badge">${colTickets.length}</span>
+        </div>`;
+      for (const t of colTickets) {
+        const doneCount = (t.checklist || []).filter(i => i.done).length;
+        const totalCount = (t.checklist || []).length;
+        const prevCol = ci > 0 ? cols[ci - 1].slug : null;
+        const nextCol = ci < cols.length - 1 ? cols[ci + 1].slug : null;
+        html += `<div class="kanban-card" data-ticket-id="${esc(t.id)}">
+          <div style="font-weight:600;margin-bottom:6px">${esc(t.title)}</div>
+          <div class="row" style="gap:4px;margin-bottom:6px">
+            <span class="badge pri-${esc(t.priority)}">${esc(t.priority)}</span>
+            ${(t.labels || []).map(l => `<span class="badge">${esc(l)}</span>`).join('')}
+          </div>
+          <div class="muted" style="margin-bottom:6px">
+            ${t.assignee_name ? '@' + esc(t.assignee_name) + ' · ' : ''}
+            ${totalCount ? `☑ ${doneCount}/${totalCount} · ` : ''}
+            💬 ${t.comment_count || 0}
+          </div>
+          <div class="row" style="gap:4px">
+            ${prevCol ? `<button class="btn" data-move-id="${esc(t.id)}" data-move-col="${esc(prevCol)}" style="padding:2px 8px;font-size:0.75rem">←</button>` : ''}
+            ${nextCol ? `<button class="btn" data-move-id="${esc(t.id)}" data-move-col="${esc(nextCol)}" style="padding:2px 8px;font-size:0.75rem">→</button>` : ''}
+          </div>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div><div id="ticketModal"></div>`;
+    app.innerHTML = html;
+
+    document.getElementById('toggleNewTicketBtn').onclick = () => {
+      document.getElementById('newTicketForm').classList.toggle('hidden');
+    };
+    document.getElementById('createTicketBtn').onclick = async () => {
+      const title = document.getElementById('ktTitle').value.trim();
+      if (!title) return;
+      const labels = document.getElementById('ktLabels').value.split(',').map(s => s.trim()).filter(Boolean);
+      const assignee = document.getElementById('ktAssignee').value.trim() || null;
+      await api('/api/v1/kanban/tickets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title,
+          description: document.getElementById('ktDesc').value,
+          column_slug: document.getElementById('ktCol').value,
+          priority: document.getElementById('ktPri').value,
+          assignee_name: assignee,
+          labels
+        })
+      });
+      renderKanban();
+    };
+    app.querySelectorAll('button[data-move-id]').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        await api(`/api/v1/kanban/tickets/${encodeURIComponent(btn.dataset.moveId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ column_slug: btn.dataset.moveCol })
+        });
+        renderKanban();
+      };
+    });
+    app.querySelectorAll('.kanban-card[data-ticket-id]').forEach(card => {
+      card.onclick = () => openTicketModal(card.dataset.ticketId, cols);
+    });
+  }
+
+  async function openTicketModal(ticketId, cols) {
+    const res = await api(`/api/v1/kanban/tickets/${encodeURIComponent(ticketId)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const t = data.ticket;
+    const comments = data.comments || [];
+    const colOpts = cols.map(c => `<option value="${esc(c.slug)}"${c.slug === t.column_slug ? ' selected' : ''}>${esc(c.title)}</option>`).join('');
+    const canDelete = me && (me.role === 'admin' || me.agent_id === t.created_by_id);
+
+    const modal = document.getElementById('ticketModal');
+    modal.innerHTML = `<div class="modal-backdrop" id="modalBackdrop">
+      <div class="modal-panel" id="modalPanel">
+        <div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <h3 style="margin:0">${esc(t.title)}</h3>
+          <button class="btn" id="closeModalBtn">Close</button>
+        </div>
+        <div class="muted" style="margin-bottom:10px">
+          Created by ${esc(t.created_by_name)} · ${esc(t.created_at)}
+          ${t.assignee_name ? ' · Assignee: @' + esc(t.assignee_name) : ''}
+        </div>
+        <div class="row" style="margin-bottom:10px">
+          <select id="mCol" style="flex:1;margin:0">${colOpts}</select>
+          <select id="mPri" style="flex:1;margin:0">
+            ${['low','medium','high','urgent'].map(p => `<option value="${p}"${p === t.priority ? ' selected' : ''}>${p}</option>`).join('')}
+          </select>
+          <button class="btn btn-primary" id="saveTicketMetaBtn">Save</button>
+          ${canDelete ? `<button class="btn btn-danger" id="delTicketBtn">Delete</button>` : ''}
+        </div>
+        <pre>${esc(t.description || '(no description)')}</pre>
+        ${(t.checklist && t.checklist.length) ? `<div class="card"><strong>Checklist</strong>${t.checklist.map((item, idx) =>
+          `<div style="margin-top:6px"><label><input type="checkbox" data-chk="${idx}" ${item.done ? 'checked' : ''} style="width:auto;margin:0 6px 0 0">${esc(item.text)}</label></div>`
+        ).join('')}</div>` : ''}
+        <h4>Comments (${comments.length})</h4>
+        ${comments.map(c => `<div class="card"><div class="muted">${esc(c.author_name)} · ${esc(c.created_at)}</div><pre>${esc(c.body)}</pre></div>`).join('')}
+        <textarea id="mCommentBody" placeholder="Add a comment (supports @mentions)..." style="min-height:70px"></textarea>
+        <button class="btn btn-primary" id="addCommentBtn">Post Comment</button>
+      </div>
+    </div>`;
+
+    document.getElementById('modalBackdrop').onclick = (e) => {
+      if (e.target.id === 'modalBackdrop') { modal.innerHTML = ''; renderKanban(); }
+    };
+    document.getElementById('closeModalBtn').onclick = () => { modal.innerHTML = ''; renderKanban(); };
+    document.getElementById('saveTicketMetaBtn').onclick = async () => {
+      await api(`/api/v1/kanban/tickets/${encodeURIComponent(ticketId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          column_slug: document.getElementById('mCol').value,
+          priority: document.getElementById('mPri').value
+        })
+      });
+      openTicketModal(ticketId, cols);
+    };
+    const delBtn = document.getElementById('delTicketBtn');
+    if (delBtn) delBtn.onclick = async () => {
+      await api(`/api/v1/kanban/tickets/${encodeURIComponent(ticketId)}`, { method: 'DELETE' });
+      modal.innerHTML = '';
+      renderKanban();
+    };
+    modal.querySelectorAll('input[data-chk]').forEach(chk => {
+      chk.onchange = async () => {
+        const updated = (t.checklist || []).map((item, idx) => idx === Number(chk.dataset.chk) ? { text: item.text, done: chk.checked } : item);
+        await api(`/api/v1/kanban/tickets/${encodeURIComponent(ticketId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ checklist: updated })
+        });
+        openTicketModal(ticketId, cols);
+      };
+    });
+    document.getElementById('addCommentBtn').onclick = async () => {
+      const body = document.getElementById('mCommentBody').value.trim();
+      if (!body) return;
+      await api(`/api/v1/kanban/tickets/${encodeURIComponent(ticketId)}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body })
+      });
+      openTicketModal(ticketId, cols);
     };
   }
 

@@ -2,6 +2,7 @@ pub mod admin;
 pub mod boards;
 pub mod events;
 pub mod files;
+pub mod kanban;
 pub mod mcp;
 pub mod oauth;
 pub mod pings;

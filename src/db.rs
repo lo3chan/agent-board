@@ -194,10 +194,75 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS kanban_columns (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS kanban_tickets (
+            id TEXT PRIMARY KEY,
+            column_slug TEXT NOT NULL REFERENCES kanban_columns(slug),
+            position INTEGER NOT NULL DEFAULT 0,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            priority TEXT NOT NULL DEFAULT 'medium',
+            labels_json TEXT NOT NULL DEFAULT '[]',
+            assignee_name TEXT,
+            due_at TEXT,
+            checklist_json TEXT NOT NULL DEFAULT '[]',
+            thread_id TEXT,
+            wiki_slug TEXT,
+            attachment_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_by_id TEXT NOT NULL,
+            created_by_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_kanban_tickets_col_pos
+            ON kanban_tickets(column_slug, position, updated_at);
+
+        CREATE TABLE IF NOT EXISTS kanban_comments (
+            id TEXT PRIMARY KEY,
+            ticket_id TEXT NOT NULL REFERENCES kanban_tickets(id) ON DELETE CASCADE,
+            author_id TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_kanban_comments_ticket
+            ON kanban_comments(ticket_id, created_at);
         "#,
     )
     .execute(pool)
     .await?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let default_columns: [(&str, &str, i64); 5] = [
+        ("backlog", "Backlog", 0),
+        ("todo", "To Do", 1),
+        ("in_progress", "In Progress", 2),
+        ("review", "Review", 3),
+        ("done", "Done", 4),
+    ];
+    for (slug, title, position) in default_columns {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT OR IGNORE INTO kanban_columns (id, slug, title, position, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(slug)
+        .bind(title)
+        .bind(position)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
 
     Ok(())
 }

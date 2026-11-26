@@ -382,6 +382,120 @@ fn tool_definitions() -> Value {
                 "required": ["name"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "kanban_board",
+            "description": "List all Kanban columns and tickets, optionally filtered by column, assignee, label, or priority.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "column": { "type": "string", "description": "Optional column slug filter (e.g. 'todo', 'in_progress')." },
+                    "assignee": { "type": "string", "description": "Optional assignee agent name filter." },
+                    "label": { "type": "string", "description": "Optional label filter." },
+                    "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"], "description": "Optional priority filter." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "kanban_get_ticket",
+            "description": "Get full details, comments, and attachments for a Kanban ticket by ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": { "type": "string", "description": "Ticket UUID." }
+                },
+                "required": ["ticket_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "kanban_create_ticket",
+            "description": "Create a new Kanban ticket. Defaults to column 'todo' and priority 'medium'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Ticket title." },
+                    "description": { "type": "string", "description": "Optional Markdown description (supports @mentions)." },
+                    "column_slug": { "type": "string", "description": "Column slug (defaults to 'todo')." },
+                    "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"], "description": "Ticket priority (defaults to 'medium')." },
+                    "labels": { "type": "array", "items": { "type": "string" }, "description": "Optional list of labels." },
+                    "assignee_name": { "type": "string", "description": "Optional assignee agent name." },
+                    "due_at": { "type": "string", "description": "Optional due date/time (ISO-8601)." },
+                    "checklist": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string" },
+                                "done": { "type": "boolean" }
+                            },
+                            "required": ["text"]
+                        },
+                        "description": "Optional checklist items."
+                    },
+                    "thread_id": { "type": "string", "description": "Optional linked thread UUID." },
+                    "wiki_slug": { "type": "string", "description": "Optional linked wiki page slug." }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "kanban_update_ticket",
+            "description": "Update or move a Kanban ticket (title, description, column_slug, position, priority, labels, assignee_name, due_at, checklist).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": { "type": "string", "description": "Ticket UUID." },
+                    "title": { "type": "string" },
+                    "description": { "type": "string" },
+                    "column_slug": { "type": "string", "description": "Target column slug." },
+                    "position": { "type": "integer", "description": "Sort position within column." },
+                    "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"] },
+                    "labels": { "type": "array", "items": { "type": "string" } },
+                    "assignee_name": { "type": ["string", "null"] },
+                    "due_at": { "type": ["string", "null"] },
+                    "checklist": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string" },
+                                "done": { "type": "boolean" }
+                            },
+                            "required": ["text"]
+                        }
+                    }
+                },
+                "required": ["ticket_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "kanban_delete_ticket",
+            "description": "Delete a Kanban ticket by ID (creator or admin only).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": { "type": "string", "description": "Ticket UUID." }
+                },
+                "required": ["ticket_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "kanban_add_comment",
+            "description": "Add a comment to a Kanban ticket (supports @mentions and auto-pings assignee).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": { "type": "string", "description": "Ticket UUID." },
+                    "body": { "type": "string", "description": "Comment body." }
+                },
+                "required": ["ticket_id", "body"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -416,6 +530,12 @@ async fn dispatch_tool(state: &AppState, agent: &AuthAgent, name: &str, args: &V
         "ack_ping" => tool_ack_ping(state, agent, args).await,
         "list_tools" => tool_list_tools(state, agent).await,
         "call_tool" => tool_call_tool(state, agent, args).await,
+        "kanban_board" => tool_kanban_board(state, args).await,
+        "kanban_get_ticket" => tool_kanban_get_ticket(state, args).await,
+        "kanban_create_ticket" => tool_kanban_create_ticket(state, agent, args).await,
+        "kanban_update_ticket" => tool_kanban_update_ticket(state, agent, args).await,
+        "kanban_delete_ticket" => tool_kanban_delete_ticket(state, agent, args).await,
+        "kanban_add_comment" => tool_kanban_add_comment(state, agent, args).await,
         _ => tool_err(format!("Unknown tool: {name}")),
     }
 }
@@ -1293,5 +1413,81 @@ async fn tool_call_tool(state: &AppState, agent: &AuthAgent, args: &Value) -> Va
     match crate::routes::tools::execute_tool(state, agent, tool_name, tool_args).await {
         Ok(res) => tool_ok(res),
         Err((status, Json(err_body))) => tool_err(format!("HTTP {status}: {err_body}")),
+    }
+}
+
+async fn tool_kanban_board(state: &AppState, args: &Value) -> Value {
+    let filter: crate::routes::kanban::KanbanFilterQuery =
+        serde_json::from_value(args.clone()).unwrap_or_default();
+    match crate::routes::kanban::query_board(&state.pool, &filter).await {
+        Ok((columns, tickets)) => tool_ok(json!({ "columns": columns, "tickets": tickets })),
+        Err(e) => tool_err(format!("Database error: {e}")),
+    }
+}
+
+async fn tool_kanban_get_ticket(state: &AppState, args: &Value) -> Value {
+    let ticket_id = match req_str(args, "ticket_id") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match crate::routes::kanban::get_ticket_inner(&state.pool, ticket_id).await {
+        Ok((ticket, comments, attachments)) => tool_ok(json!({
+            "ticket": ticket,
+            "comments": comments,
+            "attachments": attachments
+        })),
+        Err((status, msg)) => tool_err(format!("HTTP {status}: {msg}")),
+    }
+}
+
+async fn tool_kanban_create_ticket(state: &AppState, agent: &AuthAgent, args: &Value) -> Value {
+    let req: crate::routes::kanban::CreateTicketReq = match serde_json::from_value(args.clone()) {
+        Ok(r) => r,
+        Err(e) => return tool_err(format!("Invalid arguments: {e}")),
+    };
+    match crate::routes::kanban::create_ticket_inner(state, agent, req).await {
+        Ok(ticket) => tool_ok(json!({ "ticket": ticket })),
+        Err((status, msg)) => tool_err(format!("HTTP {status}: {msg}")),
+    }
+}
+
+async fn tool_kanban_update_ticket(state: &AppState, agent: &AuthAgent, args: &Value) -> Value {
+    let ticket_id = match req_str(args, "ticket_id") {
+        Ok(s) => s.to_string(),
+        Err(e) => return e,
+    };
+    let req: crate::routes::kanban::UpdateTicketReq = match serde_json::from_value(args.clone()) {
+        Ok(r) => r,
+        Err(e) => return tool_err(format!("Invalid arguments: {e}")),
+    };
+    match crate::routes::kanban::update_ticket_inner(state, agent, &ticket_id, req).await {
+        Ok(ticket) => tool_ok(json!({ "ticket": ticket })),
+        Err((status, msg)) => tool_err(format!("HTTP {status}: {msg}")),
+    }
+}
+
+async fn tool_kanban_delete_ticket(state: &AppState, agent: &AuthAgent, args: &Value) -> Value {
+    let ticket_id = match req_str(args, "ticket_id") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match crate::routes::kanban::delete_ticket_inner(state, agent, ticket_id).await {
+        Ok(()) => tool_ok(json!({ "deleted": ticket_id })),
+        Err((status, msg)) => tool_err(format!("HTTP {status}: {msg}")),
+    }
+}
+
+async fn tool_kanban_add_comment(state: &AppState, agent: &AuthAgent, args: &Value) -> Value {
+    let ticket_id = match req_str(args, "ticket_id") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let body = match req_str(args, "body") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match crate::routes::kanban::add_comment_inner(state, agent, ticket_id, body).await {
+        Ok(comment) => tool_ok(json!({ "comment": comment })),
+        Err((status, msg)) => tool_err(format!("HTTP {status}: {msg}")),
     }
 }

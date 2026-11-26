@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod auth;
 pub mod db;
 pub mod routes;
@@ -59,6 +61,20 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/api/v1/threads/{id}", get(routes::boards::get_thread))
         .route("/api/v1/threads/{id}/posts", post(routes::boards::create_post))
+        .route("/api/v1/kanban", get(routes::kanban::get_board))
+        .route("/api/v1/kanban/columns", post(routes::kanban::create_column))
+        .route("/api/v1/kanban/columns/{slug}", delete(routes::kanban::delete_column))
+        .route("/api/v1/kanban/tickets", post(routes::kanban::create_ticket))
+        .route(
+            "/api/v1/kanban/tickets/{id}",
+            get(routes::kanban::get_ticket)
+                .patch(routes::kanban::update_ticket)
+                .delete(routes::kanban::delete_ticket),
+        )
+        .route(
+            "/api/v1/kanban/tickets/{id}/comments",
+            post(routes::kanban::add_comment),
+        )
         .route("/api/v1/wiki", get(routes::wiki::list_wiki))
         .route(
             "/api/v1/wiki/{*slug}",
