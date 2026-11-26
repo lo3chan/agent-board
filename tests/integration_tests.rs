@@ -2131,3 +2131,243 @@ async fn tool_guardrails_protect_self_and_require_confirm() {
         .unwrap()
         .contains("confirm"));
 }
+
+#[tokio::test]
+async fn list_threads_pagination_filtering_and_tool_actor_headers() {
+    use axum::{http::HeaderMap, routing::post, Json as AxumJson};
+
+    let (app, _dir) = setup_app().await;
+    let admin_auth = format!("Bearer {BOOTSTRAP_ADMIN}");
+
+    // Mint an agent token
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/tokens")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"name": "Gemini", "role": "agent"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let agent_token = body_json(resp).await["token"].as_str().unwrap().to_string();
+    let agent_auth = format!("Bearer {agent_token}");
+
+    // Create the 'general' board
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/boards")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "slug": "general", "name": "General", "description": "General board" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Create 3 threads with small gaps so updated_at differs
+    let mut created_ids = Vec::new();
+    let mut updated_ats = Vec::new();
+    for i in 1..=3 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/boards/general/threads")
+                    .header(header::AUTHORIZATION, &agent_auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "title": format!("Thread {i}"),
+                            "body": format!("Body {i}")
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let t = body_json(resp).await;
+        created_ids.push(t["id"].as_str().unwrap().to_string());
+        updated_ats.push(t["updated_at"].as_str().unwrap().to_string());
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+
+    // 1. REST limit=2 returns the 2 most recent threads
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/boards/general/threads?limit=2")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let threads = body["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), 2);
+    assert_eq!(threads[0]["id"], created_ids[2]);
+    assert_eq!(threads[1]["id"], created_ids[1]);
+
+    // 2. REST updated_since filters older threads
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/boards/general/threads?updated_since={}",
+                    updated_ats[1]
+                ))
+                .header(header::AUTHORIZATION, &agent_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let threads = body["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), 2);
+    assert_eq!(threads[0]["id"], created_ids[2]);
+    assert_eq!(threads[1]["id"], created_ids[1]);
+
+    // 3. MCP list_threads supports limit and updated_since
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "list_threads",
+                            "arguments": {
+                                "board_slug": "general",
+                                "limit": 1,
+                                "updated_since": updated_ats[1]
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mcp_body = body_json(resp).await;
+    let text = mcp_body["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    let mcp_threads = parsed["threads"].as_array().unwrap();
+    assert_eq!(mcp_threads.len(), 1);
+    assert_eq!(mcp_threads[0]["id"], created_ids[2]);
+
+    // 4. execute_tool injects X-Agent-Board-Actor and X-Agent-Board-Role headers
+    let mock_router = Router::new().route(
+        "/whoami",
+        post(|headers: HeaderMap, AxumJson(_body): AxumJson<Value>| async move {
+            let actor = headers
+                .get("x-agent-board-actor")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let role = headers
+                .get("x-agent-board-role")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            AxumJson(json!({ "actor": actor, "role": role }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_router).await.unwrap();
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/tools")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "mock.whoami",
+                        "description": "Echo actor headers",
+                        "method": "POST",
+                        "url_template": format!("http://{addr}/whoami"),
+                        "allowed_roles": "all"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Call as agent ("Gemini", "agent")
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/mock.whoami")
+                .header(header::AUTHORIZATION, &agent_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["result"]["actor"], "Gemini");
+    assert_eq!(body["result"]["role"], "agent");
+
+    // Call as admin ("Antigravity", "admin")
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/mock.whoami")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["result"]["actor"], "Antigravity");
+    assert_eq!(body["result"]["role"], "admin");
+}

@@ -26,7 +26,7 @@ pub struct AppState {
 
 pub fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(65))
         .build()
         .expect("Failed to build HTTP client")
 }

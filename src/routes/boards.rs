@@ -5,7 +5,7 @@ use crate::{
     AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Extension, Json,
@@ -294,9 +294,70 @@ pub async fn create_board(
     }
 }
 
+#[derive(Deserialize)]
+pub struct ListThreadsQuery {
+    pub limit: Option<i64>,
+    pub updated_since: Option<String>,
+}
+
+pub async fn query_threads_for_board(
+    pool: &SqlitePool,
+    board_id: &str,
+    limit: Option<i64>,
+    updated_since: Option<&str>,
+) -> Result<Vec<ThreadSummary>, sqlx::Error> {
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let updated_since = updated_since.map(str::trim).filter(|s| !s.is_empty());
+
+    let mut threads: Vec<ThreadSummary> = if let Some(since) = updated_since {
+        sqlx::query_as(
+            r#"
+            SELECT t.id, t.board_id, t.author_id, t.author_name, t.title, t.body, t.pinned,
+                   t.created_at, t.updated_at, COUNT(p.id) AS post_count
+            FROM threads t
+            LEFT JOIN posts p ON p.thread_id = t.id
+            WHERE t.board_id = ? AND t.updated_at >= ?
+            GROUP BY t.id
+            ORDER BY t.pinned DESC, t.updated_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(board_id)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT t.id, t.board_id, t.author_id, t.author_name, t.title, t.body, t.pinned,
+                   t.created_at, t.updated_at, COUNT(p.id) AS post_count
+            FROM threads t
+            LEFT JOIN posts p ON p.thread_id = t.id
+            WHERE t.board_id = ?
+            GROUP BY t.id
+            ORDER BY t.pinned DESC, t.updated_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(board_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let thread_ids: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
+    let mut att_map = fetch_attachments_for_targets(pool, "thread", &thread_ids).await;
+    for t in &mut threads {
+        t.attachments = att_map.remove(&t.id).unwrap_or_default();
+    }
+    Ok(threads)
+}
+
 pub async fn list_threads(
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    Query(query): Query<ListThreadsQuery>,
 ) -> impl IntoResponse {
     let board: Option<(String, String, String, String)> =
         sqlx::query_as("SELECT id, slug, name, description FROM boards WHERE slug = ?")
@@ -309,34 +370,19 @@ pub async fn list_threads(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "board_not_found" }))).into_response();
     };
 
-    let threads: Result<Vec<ThreadSummary>, _> = sqlx::query_as(
-        r#"
-        SELECT t.id, t.board_id, t.author_id, t.author_name, t.title, t.body, t.pinned,
-               t.created_at, t.updated_at, COUNT(p.id) AS post_count
-        FROM threads t
-        LEFT JOIN posts p ON p.thread_id = t.id
-        WHERE t.board_id = ?
-        GROUP BY t.id
-        ORDER BY t.pinned DESC, t.updated_at DESC
-        "#,
+    match query_threads_for_board(
+        &state.pool,
+        &board_id,
+        query.limit,
+        query.updated_since.as_deref(),
     )
-    .bind(&board_id)
-    .fetch_all(&state.pool)
-    .await;
-
-    match threads {
-        Ok(mut threads) => {
-            let thread_ids: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
-            let mut att_map = fetch_attachments_for_targets(&state.pool, "thread", &thread_ids).await;
-            for t in &mut threads {
-                t.attachments = att_map.remove(&t.id).unwrap_or_default();
-            }
-            Json(serde_json::json!({
-                "board": { "id": board_id, "slug": b_slug, "name": b_name, "description": b_desc },
-                "threads": threads
-            }))
-            .into_response()
-        }
+    .await
+    {
+        Ok(threads) => Json(serde_json::json!({
+            "board": { "id": board_id, "slug": b_slug, "name": b_name, "description": b_desc },
+            "threads": threads
+        }))
+        .into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "db_error" }))).into_response(),
     }
 }

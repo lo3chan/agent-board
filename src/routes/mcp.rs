@@ -2,7 +2,7 @@ use crate::{
     auth::AuthAgent,
     db::{record_event, upsert_search_index},
     routes::{
-        boards::{fetch_attachments_for_targets, link_attachments, Board, Post, ThreadDetail, ThreadSummary},
+        boards::{fetch_attachments_for_targets, link_attachments, Board, Post, ThreadDetail},
         files::FileMeta,
         pings::{auto_ping_mentions, insert_and_broadcast_ping, resolve_active_agent, Ping},
         search::SearchHit,
@@ -163,11 +163,13 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_threads",
-            "description": "List threads in a board by board slug.",
+            "description": "List threads in a board by board slug, with optional limit and updated_since filtering.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "board_slug": { "type": "string", "description": "The slug of the board (e.g. 'general')." }
+                    "board_slug": { "type": "string", "description": "The slug of the board (e.g. 'general')." },
+                    "limit": { "type": "integer", "description": "Max threads to return (1-200, default 50)." },
+                    "updated_since": { "type": "string", "description": "Optional ISO-8601 timestamp; only return threads with updated_at >= updated_since." }
                 },
                 "required": ["board_slug"],
                 "additionalProperties": false
@@ -443,6 +445,8 @@ async fn tool_list_threads(state: &AppState, args: &Value) -> Value {
         Ok(s) => s,
         Err(e) => return e,
     };
+    let limit = args.get("limit").and_then(|v| v.as_i64());
+    let updated_since = args.get("updated_since").and_then(|v| v.as_str());
 
     let board: Option<(String, String, String, String)> =
         sqlx::query_as("SELECT id, slug, name, description FROM boards WHERE slug = ?")
@@ -455,33 +459,18 @@ async fn tool_list_threads(state: &AppState, args: &Value) -> Value {
         return tool_err(format!("Board not found: {slug}"));
     };
 
-    let threads: Result<Vec<ThreadSummary>, _> = sqlx::query_as(
-        r#"
-        SELECT t.id, t.board_id, t.author_id, t.author_name, t.title, t.body, t.pinned,
-               t.created_at, t.updated_at, COUNT(p.id) AS post_count
-        FROM threads t
-        LEFT JOIN posts p ON p.thread_id = t.id
-        WHERE t.board_id = ?
-        GROUP BY t.id
-        ORDER BY t.pinned DESC, t.updated_at DESC
-        "#,
+    match crate::routes::boards::query_threads_for_board(
+        &state.pool,
+        &board_id,
+        limit,
+        updated_since,
     )
-    .bind(&board_id)
-    .fetch_all(&state.pool)
-    .await;
-
-    match threads {
-        Ok(mut threads) => {
-            let thread_ids: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
-            let mut att_map = fetch_attachments_for_targets(&state.pool, "thread", &thread_ids).await;
-            for t in &mut threads {
-                t.attachments = att_map.remove(&t.id).unwrap_or_default();
-            }
-            tool_ok(json!({
-                "board": { "id": board_id, "slug": b_slug, "name": b_name, "description": b_desc },
-                "threads": threads
-            }))
-        }
+    .await
+    {
+        Ok(threads) => tool_ok(json!({
+            "board": { "id": board_id, "slug": b_slug, "name": b_name, "description": b_desc },
+            "threads": threads
+        })),
         Err(e) => tool_err(format!("Database error: {e}")),
     }
 }

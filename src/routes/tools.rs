@@ -339,6 +339,10 @@ pub async fn execute_tool(
         }
     }
 
+    req_builder = req_builder
+        .header("X-Agent-Board-Actor", &agent.name)
+        .header("X-Agent-Board-Role", &agent.role);
+
     if method == reqwest::Method::GET || method == reqwest::Method::DELETE {
         let query_pairs: Vec<(String, String)> = args_map
             .iter()
