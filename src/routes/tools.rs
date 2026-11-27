@@ -1,11 +1,17 @@
-use crate::{auth::AuthAgent, db::record_event, AppState};
+use crate::{
+    auth::AuthAgent,
+    db::record_event,
+    routes::{files::FileMeta, kanban},
+    AppState,
+};
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Extension, Json,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -232,6 +238,68 @@ fn substitute_url_template(
     Ok(result)
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ListToolsQuery {
+    pub prefix: Option<String>,
+    pub search: Option<String>,
+    pub compact: Option<bool>,
+}
+
+fn builtin_tools() -> Vec<PublicToolInfo> {
+    let items: [(&str, &str, Value); 8] = [
+        (
+            "files.read",
+            "Read an uploaded file by ID or filename (returns UTF-8 text or base64 data + mime_type for images/audio, up to 5 MB).",
+            json!({"type":"object","properties":{"file_id":{"type":"string"},"filename":{"type":"string"}}}),
+        ),
+        (
+            "kanban_board",
+            "List all Kanban columns and active tickets (optional column, assignee, label, priority, include_archived, archived_only).",
+            json!({"type":"object","properties":{"column":{"type":"string"},"assignee":{"type":"string"},"label":{"type":"string"},"priority":{"type":"string"},"include_archived":{"type":"boolean"},"archived_only":{"type":"boolean"}}}),
+        ),
+        (
+            "kanban_get_ticket",
+            "Get full details, comments, and attachments for a Kanban ticket by ID.",
+            json!({"type":"object","properties":{"ticket_id":{"type":"string"}},"required":["ticket_id"]}),
+        ),
+        (
+            "kanban_create_ticket",
+            "Create a new Kanban ticket (defaults to column_slug='todo', priority='medium').",
+            json!({"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"column_slug":{"type":"string"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"assignee_name":{"type":"string"},"due_at":{"type":"string"}},"required":["title"]}),
+        ),
+        (
+            "kanban_update_ticket",
+            "Update, move, or archive/unarchive a Kanban ticket.",
+            json!({"type":"object","properties":{"ticket_id":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"column_slug":{"type":"string"},"position":{"type":"integer"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"assignee_name":{"type":["string","null"]},"due_at":{"type":["string","null"]},"archived":{"type":"boolean"}},"required":["ticket_id"]}),
+        ),
+        (
+            "kanban_delete_ticket",
+            "Delete a Kanban ticket by ID (creator or admin only).",
+            json!({"type":"object","properties":{"ticket_id":{"type":"string"}},"required":["ticket_id"]}),
+        ),
+        (
+            "kanban_add_comment",
+            "Add a comment to a Kanban ticket (supports @mentions and auto-pings assignee).",
+            json!({"type":"object","properties":{"ticket_id":{"type":"string"},"body":{"type":"string"}},"required":["ticket_id","body"]}),
+        ),
+        (
+            "kanban_archive_done",
+            "Archive all completed tickets in the 'done' column (optional older_than_days).",
+            json!({"type":"object","properties":{"older_than_days":{"type":"integer"}}}),
+        ),
+    ];
+    items
+        .into_iter()
+        .map(|(name, description, input_schema)| PublicToolInfo {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema,
+            allowed_roles: "all".to_string(),
+            updated_at: "built-in".to_string(),
+        })
+        .collect()
+}
+
 pub async fn query_visible_tools(
     state: &AppState,
     agent: &AuthAgent,
@@ -250,7 +318,7 @@ pub async fn query_visible_tools(
         .await?
     };
 
-    Ok(rows
+    let mut out: Vec<PublicToolInfo> = rows
         .into_iter()
         .map(|(name, description, input_schema, allowed_roles, updated_at)| {
             let parsed_schema = serde_json::from_str(&input_schema).unwrap_or_else(|_| json!({}));
@@ -262,17 +330,191 @@ pub async fn query_visible_tools(
                 updated_at,
             }
         })
-        .collect())
+        .collect();
+    out.extend(builtin_tools());
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 pub async fn list_tools(
     State(state): State<AppState>,
     Extension(agent): Extension<AuthAgent>,
+    Query(query): Query<ListToolsQuery>,
 ) -> impl IntoResponse {
+    let prefix_f = query.prefix.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let search_f = query.search.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let compact = query.compact.unwrap_or(false);
+
     match query_visible_tools(&state, &agent).await {
-        Ok(tools) => Json(json!({ "tools": tools })).into_response(),
+        Ok(tools) => {
+            let filtered: Vec<Value> = tools
+                .into_iter()
+                .filter(|t| {
+                    if let Some(ref p) = prefix_f {
+                        if !t.name.to_lowercase().starts_with(p) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref s) = search_f {
+                        if !t.name.to_lowercase().contains(s) && !t.description.to_lowercase().contains(s) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .map(|t| {
+                    if compact {
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "allowed_roles": t.allowed_roles,
+                        })
+                    } else {
+                        serde_json::to_value(t).unwrap_or_else(|_| json!({}))
+                    }
+                })
+                .collect();
+            Json(json!({ "tools": filtered })).into_response()
+        }
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()).into_response(),
     }
+}
+
+async fn execute_builtin_tool(
+    state: &AppState,
+    agent: &AuthAgent,
+    name: &str,
+    args: Value,
+) -> Option<Result<Value, (StatusCode, Json<Value>)>> {
+    let result: Result<Value, (StatusCode, Json<Value>)> = match name {
+        "kanban_board" => {
+            let filter: kanban::KanbanFilterQuery = serde_json::from_value(args).unwrap_or_default();
+            match kanban::query_board(&state.pool, &filter).await {
+                Ok((columns, tickets)) => Ok(json!({ "columns": columns, "tickets": tickets })),
+                Err(e) => Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string())),
+            }
+        }
+        "kanban_get_ticket" => {
+            let Some(ticket_id) = args.get("ticket_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+                return Some(Err(err_resp(StatusCode::BAD_REQUEST, "invalid_arguments", "Missing required 'ticket_id'")));
+            };
+            match kanban::get_ticket_inner(&state.pool, ticket_id).await {
+                Ok((ticket, comments, attachments)) => Ok(json!({ "ticket": ticket, "comments": comments, "attachments": attachments })),
+                Err((status, msg)) => Err(err_resp(status, msg, msg)),
+            }
+        }
+        "kanban_create_ticket" => match serde_json::from_value::<kanban::CreateTicketReq>(args) {
+            Ok(req) => match kanban::create_ticket_inner(state, agent, req).await {
+                Ok(ticket) => Ok(json!({ "ticket": ticket })),
+                Err((status, msg)) => Err(err_resp(status, msg, msg)),
+            },
+            Err(e) => Err(err_resp(StatusCode::BAD_REQUEST, "invalid_arguments", e.to_string())),
+        },
+        "kanban_update_ticket" => {
+            let Some(ticket_id) = args.get("ticket_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string) else {
+                return Some(Err(err_resp(StatusCode::BAD_REQUEST, "invalid_arguments", "Missing required 'ticket_id'")));
+            };
+            match serde_json::from_value::<kanban::UpdateTicketReq>(args) {
+                Ok(req) => match kanban::update_ticket_inner(state, agent, &ticket_id, req).await {
+                    Ok(ticket) => Ok(json!({ "ticket": ticket })),
+                    Err((status, msg)) => Err(err_resp(status, msg, msg)),
+                },
+                Err(e) => Err(err_resp(StatusCode::BAD_REQUEST, "invalid_arguments", e.to_string())),
+            }
+        }
+        "kanban_delete_ticket" => {
+            let Some(ticket_id) = args.get("ticket_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+                return Some(Err(err_resp(StatusCode::BAD_REQUEST, "invalid_arguments", "Missing required 'ticket_id'")));
+            };
+            match kanban::delete_ticket_inner(state, agent, ticket_id).await {
+                Ok(()) => Ok(json!({ "deleted": ticket_id })),
+                Err((status, msg)) => Err(err_resp(status, msg, msg)),
+            }
+        }
+        "kanban_add_comment" => {
+            let Some(ticket_id) = args.get("ticket_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+                return Some(Err(err_resp(StatusCode::BAD_REQUEST, "invalid_arguments", "Missing required 'ticket_id'")));
+            };
+            let Some(body) = args.get("body").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+                return Some(Err(err_resp(StatusCode::BAD_REQUEST, "invalid_arguments", "Missing required 'body'")));
+            };
+            match kanban::add_comment_inner(state, agent, ticket_id, body).await {
+                Ok(comment) => Ok(json!({ "comment": comment })),
+                Err((status, msg)) => Err(err_resp(status, msg, msg)),
+            }
+        }
+        "kanban_archive_done" => {
+            let older_than_days = args.get("older_than_days").and_then(Value::as_i64);
+            match kanban::archive_done_inner(state, agent, older_than_days).await {
+                Ok(archived_count) => Ok(json!({ "archived_count": archived_count })),
+                Err((status, msg)) => Err(err_resp(status, msg, msg)),
+            }
+        }
+        "files.read" => {
+            let file_id = args.get("file_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+            let filename = args.get("filename").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+            let meta: Option<FileMeta> = if let Some(fid) = file_id {
+                sqlx::query_as("SELECT id, filename, content_type, size_bytes, sha256, uploaded_by_id, uploaded_by_name, created_at FROM files WHERE id = ?")
+                    .bind(fid)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .ok()
+                    .flatten()
+            } else if let Some(fname) = filename {
+                sqlx::query_as("SELECT id, filename, content_type, size_bytes, sha256, uploaded_by_id, uploaded_by_name, created_at FROM files WHERE filename = ? ORDER BY created_at DESC LIMIT 1")
+                    .bind(fname)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                return Some(Err(err_resp(StatusCode::BAD_REQUEST, "invalid_arguments", "Provide 'file_id' or 'filename'")));
+            };
+            let Some(meta) = meta else {
+                return Some(Err(err_resp(StatusCode::NOT_FOUND, "file_not_found", "File not found")));
+            };
+            if meta.size_bytes > 5 * 1024 * 1024 {
+                return Some(Err(err_resp(StatusCode::PAYLOAD_TOO_LARGE, "file_too_large", "files.read supports files up to 5 MB; download via /api/v1/files/{id}")));
+            }
+            let path = state.data_dir.join("files").join(&meta.id);
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => {
+                    let (encoding, data) = if meta.content_type.starts_with("text/") || meta.content_type == "application/json" {
+                        match String::from_utf8(bytes.clone()) {
+                            Ok(s) => ("utf8", s),
+                            Err(_) => ("base64", BASE64.encode(&bytes)),
+                        }
+                    } else {
+                        ("base64", BASE64.encode(&bytes))
+                    };
+                    Ok(json!({
+                        "id": meta.id,
+                        "filename": meta.filename,
+                        "content_type": meta.content_type,
+                        "size_bytes": meta.size_bytes,
+                        "encoding": encoding,
+                        "data": data,
+                    }))
+                }
+                Err(_) => Err(err_resp(StatusCode::NOT_FOUND, "file_missing_on_disk", "File bytes not found on disk")),
+            }
+        }
+        _ => return None,
+    };
+
+    if let Ok(ref val) = result {
+        let _ = record_event(
+            &state.pool,
+            "tool.called",
+            &agent.agent_id,
+            &agent.name,
+            name,
+            &format!("Called tool '{name}'"),
+        )
+        .await;
+        return Some(Ok(json!({ "ok": true, "status": 200, "result": val })));
+    }
+    Some(result)
 }
 
 pub async fn execute_tool(
@@ -281,6 +523,9 @@ pub async fn execute_tool(
     name: &str,
     args_val: Value,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
+    if let Some(res) = execute_builtin_tool(state, agent, name, args_val.clone()).await {
+        return res;
+    }
     let tool: Option<ToolRow> = sqlx::query_as(
         "SELECT name, method, url_template, headers_json, allowed_roles FROM tools WHERE name = ?",
     )

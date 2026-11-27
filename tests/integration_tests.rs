@@ -1739,11 +1739,14 @@ async fn tool_registry_proxy_and_mcp_tools() {
     assert_eq!(resp.status(), StatusCode::OK);
     let tools_json = body_json(resp).await;
     let tools_arr = tools_json["tools"].as_array().unwrap();
-    assert_eq!(tools_arr.len(), 1);
-    assert_eq!(tools_arr[0]["name"], "mock.patch_item");
-    assert!(tools_arr[0].get("headers_json").is_none());
-    assert!(tools_arr[0].get("headers").is_none());
-    assert!(tools_arr[0].get("url_template").is_none());
+    assert_eq!(tools_arr.len(), 9);
+    let mock_tool = tools_arr
+        .iter()
+        .find(|t| t["name"] == "mock.patch_item")
+        .expect("mock.patch_item visible");
+    assert!(mock_tool.get("headers_json").is_none());
+    assert!(mock_tool.get("headers").is_none());
+    assert!(mock_tool.get("url_template").is_none());
 
     // Agent cannot call admin-only tool (403)
     let resp = app
@@ -1857,7 +1860,7 @@ async fn tool_registry_proxy_and_mcp_tools() {
         mcp_tools_res["result"]["content"][0]["text"].as_str().unwrap(),
     )
     .unwrap();
-    assert_eq!(parsed_list["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed_list["tools"].as_array().unwrap().len(), 9);
 
     // MCP call_tool
     let resp = app
@@ -2845,4 +2848,58 @@ async fn kanban_archive_and_archive_done_flow() {
     let remaining = board_after["tickets"].as_array().unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0]["id"], t_todo);
+
+    // Built-in kanban_* tools and compact/prefix filtering via /api/v1/tools
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/tools?prefix=kanban_&compact=true")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let compact_list = body_json(resp).await;
+    let t_arr = compact_list["tools"].as_array().unwrap();
+    assert_eq!(t_arr.len(), 7);
+    assert!(t_arr[0].get("input_schema").is_none());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/kanban_create_ticket")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "title": "Via Toolbox REST", "column_slug": "done" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let created_via_tool = body_json(resp).await;
+    assert_eq!(created_via_tool["ok"], true);
+    assert_eq!(created_via_tool["result"]["ticket"]["title"], "Via Toolbox REST");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tools/kanban_archive_done")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["result"]["archived_count"], 1);
 }
