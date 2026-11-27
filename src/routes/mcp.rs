@@ -392,7 +392,9 @@ fn tool_definitions() -> Value {
                     "column": { "type": "string", "description": "Optional column slug filter (e.g. 'todo', 'in_progress')." },
                     "assignee": { "type": "string", "description": "Optional assignee agent name filter." },
                     "label": { "type": "string", "description": "Optional label filter." },
-                    "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"], "description": "Optional priority filter." }
+                    "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"], "description": "Optional priority filter." },
+                    "include_archived": { "type": "boolean", "description": "Include archived tickets (default false)." },
+                    "archived_only": { "type": "boolean", "description": "Return only archived tickets (default false)." }
                 },
                 "additionalProperties": false
             }
@@ -466,7 +468,8 @@ fn tool_definitions() -> Value {
                             },
                             "required": ["text"]
                         }
-                    }
+                    },
+                    "archived": { "type": "boolean", "description": "Set true to archive (remove from board columns), false to unarchive." }
                 },
                 "required": ["ticket_id"],
                 "additionalProperties": false
@@ -494,6 +497,17 @@ fn tool_definitions() -> Value {
                     "body": { "type": "string", "description": "Comment body." }
                 },
                 "required": ["ticket_id", "body"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "kanban_archive_done",
+            "description": "Archive all completed tickets in the 'done' column (removes them from board columns without deleting history).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "older_than_days": { "type": "integer", "description": "Optional: only archive 'done' tickets not updated in at least N days (default 0 = all)." }
+                },
                 "additionalProperties": false
             }
         }
@@ -536,6 +550,7 @@ async fn dispatch_tool(state: &AppState, agent: &AuthAgent, name: &str, args: &V
         "kanban_update_ticket" => tool_kanban_update_ticket(state, agent, args).await,
         "kanban_delete_ticket" => tool_kanban_delete_ticket(state, agent, args).await,
         "kanban_add_comment" => tool_kanban_add_comment(state, agent, args).await,
+        "kanban_archive_done" => tool_kanban_archive_done(state, agent, args).await,
         _ => tool_err(format!("Unknown tool: {name}")),
     }
 }
@@ -1488,6 +1503,14 @@ async fn tool_kanban_add_comment(state: &AppState, agent: &AuthAgent, args: &Val
     };
     match crate::routes::kanban::add_comment_inner(state, agent, ticket_id, body).await {
         Ok(comment) => tool_ok(json!({ "comment": comment })),
+        Err((status, msg)) => tool_err(format!("HTTP {status}: {msg}")),
+    }
+}
+
+async fn tool_kanban_archive_done(state: &AppState, agent: &AuthAgent, args: &Value) -> Value {
+    let older_than_days = args.get("older_than_days").and_then(Value::as_i64);
+    match crate::routes::kanban::archive_done_inner(state, agent, older_than_days).await {
+        Ok(archived_count) => tool_ok(json!({ "archived_count": archived_count })),
         Err((status, msg)) => tool_err(format!("HTTP {status}: {msg}")),
     }
 }

@@ -75,6 +75,10 @@ pub fn build_app(state: AppState) -> Router {
             "/api/v1/kanban/tickets/{id}/comments",
             post(routes::kanban::add_comment),
         )
+        .route(
+            "/api/v1/kanban/archive-done",
+            post(routes::kanban::archive_done),
+        )
         .route("/api/v1/wiki", get(routes::wiki::list_wiki))
         .route(
             "/api/v1/wiki/{*slug}",

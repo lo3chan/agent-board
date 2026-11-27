@@ -212,8 +212,10 @@
     };
   }
 
+  let showArchivedKanban = false;
   async function renderKanban() {
-    const res = await api('/api/v1/kanban');
+    const url = showArchivedKanban ? '/api/v1/kanban?archived_only=true' : '/api/v1/kanban';
+    const res = await api(url);
     const data = await res.json();
     const cols = data.columns || [];
     const tickets = data.tickets || [];
@@ -221,8 +223,11 @@
     let colOpts = cols.map(c => `<option value="${esc(c.slug)}"${c.slug === 'todo' ? ' selected' : ''}>${esc(c.title)}</option>`).join('');
     let html = `<div class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:8px">
-        <h3 style="margin:0">Kanban Board</h3>
-        <button class="btn btn-primary" id="toggleNewTicketBtn">+ New Ticket</button>
+        <h3 style="margin:0">Kanban Board${showArchivedKanban ? ' (Archived)' : ''}</h3>
+        <div class="row" style="gap:8px">
+          <button class="btn" id="toggleArchivedBtn">${showArchivedKanban ? 'Back to Board' : 'Archived'}</button>
+          <button class="btn btn-primary" id="toggleNewTicketBtn">+ New Ticket</button>
+        </div>
       </div>
       <div id="newTicketForm" class="hidden" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
         <input id="ktTitle" placeholder="Ticket title">
@@ -240,43 +245,67 @@
         </div>
         <button class="btn btn-primary" id="createTicketBtn">Create Ticket</button>
       </div>
-    </div>
-    <div class="kanban-wrap">`;
+    </div>`;
 
-    for (let ci = 0; ci < cols.length; ci++) {
-      const col = cols[ci];
-      const colTickets = tickets.filter(t => t.column_slug === col.slug);
-      html += `<div class="kanban-col">
-        <div class="kanban-col-head">
-          <span>${esc(col.title)}</span>
-          <span class="badge">${colTickets.length}</span>
-        </div>`;
-      for (const t of colTickets) {
-        const doneCount = (t.checklist || []).filter(i => i.done).length;
-        const totalCount = (t.checklist || []).length;
-        const prevCol = ci > 0 ? cols[ci - 1].slug : null;
-        const nextCol = ci < cols.length - 1 ? cols[ci + 1].slug : null;
-        html += `<div class="kanban-card" data-ticket-id="${esc(t.id)}">
-          <div style="font-weight:600;margin-bottom:6px">${esc(t.title)}</div>
-          <div class="row" style="gap:4px;margin-bottom:6px">
+    if (showArchivedKanban) {
+      html += tickets.length ? `<div class="card">` + tickets.map(t => `<div class="kanban-card" data-ticket-id="${esc(t.id)}">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <div>
+            <strong>${esc(t.title)}</strong>
+            <span class="badge" style="margin-left:6px">${esc(t.column_slug)}</span>
             <span class="badge pri-${esc(t.priority)}">${esc(t.priority)}</span>
-            ${(t.labels || []).map(l => `<span class="badge">${esc(l)}</span>`).join('')}
           </div>
-          <div class="muted" style="margin-bottom:6px">
-            ${t.assignee_name ? '@' + esc(t.assignee_name) + ' · ' : ''}
-            ${totalCount ? `☑ ${doneCount}/${totalCount} · ` : ''}
-            💬 ${t.comment_count || 0}
-          </div>
-          <div class="row" style="gap:4px">
-            ${prevCol ? `<button class="btn" data-move-id="${esc(t.id)}" data-move-col="${esc(prevCol)}" style="padding:2px 8px;font-size:0.75rem">←</button>` : ''}
-            ${nextCol ? `<button class="btn" data-move-id="${esc(t.id)}" data-move-col="${esc(nextCol)}" style="padding:2px 8px;font-size:0.75rem">→</button>` : ''}
-          </div>
-        </div>`;
+          <button class="btn" data-unarchive-id="${esc(t.id)}" style="padding:3px 10px;font-size:0.78rem">Unarchive</button>
+        </div>
+        <div class="muted" style="margin-top:4px">Archived ${esc(t.archived_at || '')}${t.assignee_name ? ' · @' + esc(t.assignee_name) : ''}</div>
+      </div>`).join('') + `</div>` : `<div class="card muted">No archived tickets.</div>`;
+      html += `<div id="ticketModal"></div>`;
+    } else {
+      html += `<div class="kanban-wrap">`;
+      for (let ci = 0; ci < cols.length; ci++) {
+        const col = cols[ci];
+        const colTickets = tickets.filter(t => t.column_slug === col.slug);
+        html += `<div class="kanban-col">
+          <div class="kanban-col-head">
+            <span>${esc(col.title)}</span>
+            <div class="row" style="gap:6px;align-items:center">
+              ${(col.slug === 'done' && colTickets.length) ? `<button class="btn" id="archiveDoneBtn" style="padding:2px 8px;font-size:0.72rem" title="Archive all Done cards">Archive all</button>` : ''}
+              <span class="badge">${colTickets.length}</span>
+            </div>
+          </div>`;
+        for (const t of colTickets) {
+          const doneCount = (t.checklist || []).filter(i => i.done).length;
+          const totalCount = (t.checklist || []).length;
+          const prevCol = ci > 0 ? cols[ci - 1].slug : null;
+          const nextCol = ci < cols.length - 1 ? cols[ci + 1].slug : null;
+          html += `<div class="kanban-card" data-ticket-id="${esc(t.id)}">
+            <div style="font-weight:600;margin-bottom:6px">${esc(t.title)}</div>
+            <div class="row" style="gap:4px;margin-bottom:6px">
+              <span class="badge pri-${esc(t.priority)}">${esc(t.priority)}</span>
+              ${(t.labels || []).map(l => `<span class="badge">${esc(l)}</span>`).join('')}
+            </div>
+            <div class="muted" style="margin-bottom:6px">
+              ${t.assignee_name ? '@' + esc(t.assignee_name) + ' · ' : ''}
+              ${totalCount ? `☑ ${doneCount}/${totalCount} · ` : ''}
+              💬 ${t.comment_count || 0}
+            </div>
+            <div class="row" style="gap:4px">
+              ${prevCol ? `<button class="btn" data-move-id="${esc(t.id)}" data-move-col="${esc(prevCol)}" style="padding:2px 8px;font-size:0.75rem">←</button>` : ''}
+              ${nextCol ? `<button class="btn" data-move-id="${esc(t.id)}" data-move-col="${esc(nextCol)}" style="padding:2px 8px;font-size:0.75rem">→</button>` : ''}
+              ${col.slug === 'done' ? `<button class="btn" data-archive-id="${esc(t.id)}" style="padding:2px 8px;font-size:0.75rem;margin-left:auto">Archive</button>` : ''}
+            </div>
+          </div>`;
+        }
+        html += `</div>`;
       }
-      html += `</div>`;
+      html += `</div><div id="ticketModal"></div>`;
     }
-    html += `</div><div id="ticketModal"></div>`;
     app.innerHTML = html;
+
+    document.getElementById('toggleArchivedBtn').onclick = () => {
+      showArchivedKanban = !showArchivedKanban;
+      renderKanban();
+    };
 
     document.getElementById('toggleNewTicketBtn').onclick = () => {
       document.getElementById('newTicketForm').classList.toggle('hidden');
@@ -307,6 +336,33 @@
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ column_slug: btn.dataset.moveCol })
+        });
+        renderKanban();
+      };
+    });
+    const archiveDoneBtn = document.getElementById('archiveDoneBtn');
+    if (archiveDoneBtn) archiveDoneBtn.onclick = async () => {
+      await api('/api/v1/kanban/archive-done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      renderKanban();
+    };
+    app.querySelectorAll('button[data-archive-id]').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        await api(`/api/v1/kanban/tickets/${encodeURIComponent(btn.dataset.archiveId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ archived: true })
+        });
+        renderKanban();
+      };
+    });
+    app.querySelectorAll('button[data-unarchive-id]').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        await api(`/api/v1/kanban/tickets/${encodeURIComponent(btn.dataset.unarchiveId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ archived: false })
         });
         renderKanban();
       };
@@ -342,6 +398,7 @@
             ${['low','medium','high','urgent'].map(p => `<option value="${p}"${p === t.priority ? ' selected' : ''}>${p}</option>`).join('')}
           </select>
           <button class="btn btn-primary" id="saveTicketMetaBtn">Save</button>
+          <button class="btn" id="archiveTicketBtn">${t.archived_at ? 'Unarchive' : 'Archive'}</button>
           ${canDelete ? `<button class="btn btn-danger" id="delTicketBtn">Delete</button>` : ''}
         </div>
         <pre>${esc(t.description || '(no description)')}</pre>
@@ -369,6 +426,15 @@
         })
       });
       openTicketModal(ticketId, cols);
+    };
+    document.getElementById('archiveTicketBtn').onclick = async () => {
+      await api(`/api/v1/kanban/tickets/${encodeURIComponent(ticketId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ archived: !t.archived_at })
+      });
+      modal.innerHTML = '';
+      renderKanban();
     };
     const delBtn = document.getElementById('delTicketBtn');
     if (delBtn) delBtn.onclick = async () => {

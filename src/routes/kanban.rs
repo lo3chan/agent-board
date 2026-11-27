@@ -55,6 +55,7 @@ struct KanbanTicketRow {
     created_by_name: String,
     created_at: String,
     updated_at: String,
+    archived_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,6 +78,7 @@ pub struct KanbanTicket {
     pub created_by_name: String,
     pub created_at: String,
     pub updated_at: String,
+    pub archived_at: Option<String>,
 }
 
 impl From<KanbanTicketRow> for KanbanTicket {
@@ -100,6 +102,7 @@ impl From<KanbanTicketRow> for KanbanTicket {
             created_by_name: r.created_by_name,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            archived_at: r.archived_at,
         }
     }
 }
@@ -120,6 +123,8 @@ pub struct KanbanFilterQuery {
     pub assignee: Option<String>,
     pub label: Option<String>,
     pub priority: Option<String>,
+    pub include_archived: Option<bool>,
+    pub archived_only: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -174,6 +179,12 @@ pub struct UpdateTicketReq {
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub wiki_slug: Option<Option<String>>,
     pub attachment_ids: Option<Vec<String>>,
+    pub archived: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ArchiveDoneReq {
+    pub older_than_days: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -223,7 +234,7 @@ async fn fetch_ticket_by_id(
                t.labels_json, t.assignee_name, t.due_at, t.checklist_json,
                t.thread_id, t.wiki_slug, t.attachment_ids_json,
                COUNT(c.id) AS comment_count,
-               t.created_by_id, t.created_by_name, t.created_at, t.updated_at
+               t.created_by_id, t.created_by_name, t.created_at, t.updated_at, t.archived_at
         FROM kanban_tickets t
         LEFT JOIN kanban_comments c ON c.ticket_id = t.id
         WHERE t.id = ?
@@ -295,7 +306,7 @@ pub async fn query_board(
                t.labels_json, t.assignee_name, t.due_at, t.checklist_json,
                t.thread_id, t.wiki_slug, t.attachment_ids_json,
                COUNT(c.id) AS comment_count,
-               t.created_by_id, t.created_by_name, t.created_at, t.updated_at
+               t.created_by_id, t.created_by_name, t.created_at, t.updated_at, t.archived_at
         FROM kanban_tickets t
         LEFT JOIN kanban_comments c ON c.ticket_id = t.id
         GROUP BY t.id
@@ -309,11 +320,20 @@ pub async fn query_board(
     let ass_f = filter.assignee.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let lbl_f = filter.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let pri_f = filter.priority.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let archived_only = filter.archived_only.unwrap_or(false);
+    let include_archived = filter.include_archived.unwrap_or(false);
 
     let tickets: Vec<KanbanTicket> = rows
         .into_iter()
         .map(KanbanTicket::from)
         .filter(|t| {
+            if archived_only {
+                if t.archived_at.is_none() {
+                    return false;
+                }
+            } else if !include_archived && t.archived_at.is_some() {
+                return false;
+            }
             if let Some(c) = col_f {
                 if !t.column_slug.eq_ignore_ascii_case(c) {
                     return false;
@@ -709,13 +729,19 @@ pub async fn update_ticket_inner(
     let attachment_ids_json =
         serde_json::to_string(&attachment_ids).unwrap_or_else(|_| "[]".into());
     let now = chrono::Utc::now().to_rfc3339();
+    let archived_at = match req.archived {
+        Some(true) => Some(existing.archived_at.clone().unwrap_or_else(|| now.clone())),
+        Some(false) => None,
+        None => existing.archived_at.clone(),
+    };
+    let archive_changed = archived_at.is_some() != existing.archived_at.is_some();
 
     sqlx::query(
         r#"
         UPDATE kanban_tickets
         SET column_slug = ?, position = ?, title = ?, description = ?, priority = ?,
             labels_json = ?, assignee_name = ?, due_at = ?, checklist_json = ?,
-            thread_id = ?, wiki_slug = ?, attachment_ids_json = ?, updated_at = ?
+            thread_id = ?, wiki_slug = ?, attachment_ids_json = ?, updated_at = ?, archived_at = ?
         WHERE id = ?
         "#,
     )
@@ -732,6 +758,7 @@ pub async fn update_ticket_inner(
     .bind(&wiki_slug)
     .bind(&attachment_ids_json)
     .bind(&now)
+    .bind(&archived_at)
     .bind(id)
     .execute(&state.pool)
     .await
@@ -740,7 +767,13 @@ pub async fn update_ticket_inner(
     let _ = link_attachments(&state.pool, "ticket", id, &attachment_ids, &description).await;
     let _ = upsert_search_index(&state.pool, "ticket", id, &column_slug, &title, &description).await;
 
-    let (ev_kind, ev_summary) = if moved {
+    let (ev_kind, ev_summary) = if archive_changed {
+        if archived_at.is_some() {
+            ("ticket.archived", format!("Archived ticket: {title}"))
+        } else {
+            ("ticket.unarchived", format!("Unarchived ticket: {title}"))
+        }
+    } else if moved {
         (
             "ticket.moved",
             format!(
@@ -933,5 +966,61 @@ pub async fn add_comment(
     match add_comment_inner(&state, &agent, &ticket_id, &req.body).await {
         Ok(comment) => (StatusCode::CREATED, Json(json!({ "comment": comment }))).into_response(),
         Err((code, err)) => (code, Json(json!({ "error": err }))).into_response(),
+    }
+}
+
+pub async fn archive_done_inner(
+    state: &AppState,
+    agent: &AuthAgent,
+    older_than_days: Option<i64>,
+) -> Result<u64, (StatusCode, &'static str)> {
+    let days = older_than_days.unwrap_or(0).max(0);
+    let now_dt = chrono::Utc::now();
+    let now = now_dt.to_rfc3339();
+    let res = if days == 0 {
+        sqlx::query(
+            "UPDATE kanban_tickets SET archived_at = ?, updated_at = ? WHERE column_slug = 'done' AND archived_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.pool)
+        .await
+    } else {
+        let cutoff = (now_dt - chrono::Duration::days(days)).to_rfc3339();
+        sqlx::query(
+            "UPDATE kanban_tickets SET archived_at = ?, updated_at = ? WHERE column_slug = 'done' AND archived_at IS NULL AND updated_at <= ?",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(&cutoff)
+        .execute(&state.pool)
+        .await
+    }
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db_error"))?;
+
+    let count = res.rows_affected();
+    if count > 0 {
+        let _ = record_event(
+            &state.pool,
+            "ticket.archived_done",
+            &agent.agent_id,
+            &agent.name,
+            "done",
+            &format!("Archived {count} completed ticket(s) from done"),
+        )
+        .await;
+    }
+    Ok(count)
+}
+
+pub async fn archive_done(
+    State(state): State<AppState>,
+    Extension(agent): Extension<AuthAgent>,
+    body: Option<Json<ArchiveDoneReq>>,
+) -> impl IntoResponse {
+    let older_than_days = body.and_then(|b| b.0.older_than_days);
+    match archive_done_inner(&state, &agent, older_than_days).await {
+        Ok(archived_count) => Json(json!({ "archived_count": archived_count })).into_response(),
+        Err((status, msg)) => (status, Json(json!({ "error": msg }))).into_response(),
     }
 }

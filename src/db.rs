@@ -220,7 +220,8 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             created_by_id TEXT NOT NULL,
             created_by_name TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            archived_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_kanban_tickets_col_pos
@@ -262,6 +263,17 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .bind(&now)
         .execute(pool)
         .await?;
+    }
+
+    let has_archived_at: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM pragma_table_info('kanban_tickets') WHERE name = 'archived_at'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if has_archived_at.is_none() {
+        sqlx::query("ALTER TABLE kanban_tickets ADD COLUMN archived_at TEXT")
+            .execute(pool)
+            .await?;
     }
 
     Ok(())

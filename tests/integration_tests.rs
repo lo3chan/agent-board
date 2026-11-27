@@ -727,7 +727,7 @@ async fn oauth_discovery_dcr_pkce_and_mcp_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let list_resp = body_json(resp).await;
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 26);
+    assert_eq!(tools.len(), 27);
 
     // Call `me` tool -> resolves to Gemini identity
     let resp = app
@@ -1186,7 +1186,7 @@ async fn pings_mentions_sse_and_mcp_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let tools_resp = body_json(resp).await;
     let tools = tools_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 26);
+    assert_eq!(tools.len(), 27);
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"ping_agent"));
     assert!(names.contains(&"list_pings"));
@@ -1827,7 +1827,7 @@ async fn tool_registry_proxy_and_mcp_tools() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let mcp_list = body_json(resp).await;
-    assert_eq!(mcp_list["result"]["tools"].as_array().unwrap().len(), 26);
+    assert_eq!(mcp_list["result"]["tools"].as_array().unwrap().len(), 27);
 
     // MCP list_tools
     let resp = app
@@ -2699,4 +2699,150 @@ async fn kanban_tickets_comments_and_mcp_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn kanban_archive_and_archive_done_flow() {
+    let (app, _dir) = setup_app().await;
+    let admin_auth = format!("Bearer {BOOTSTRAP_ADMIN}");
+
+    let create = |title: &str, col: &str| {
+        let app = app.clone();
+        let auth = admin_auth.clone();
+        let title = title.to_string();
+        let col = col.to_string();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/kanban/tickets")
+                        .header(header::AUTHORIZATION, &auth)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({ "title": title, "column_slug": col }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            body_json(resp).await["ticket"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+
+    let t_todo = create("Active Todo", "todo").await;
+    let t_done1 = create("Done One", "done").await;
+    let t_done2 = create("Done Two", "done").await;
+
+    // Single ticket archive removes it from default board
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/api/v1/kanban/tickets/{t_done1}"))
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "archived": true }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let patched = body_json(resp).await;
+    assert!(patched["ticket"]["archived_at"].as_str().is_some());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/kanban")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let board = body_json(resp).await;
+    let ids: Vec<&str> = board["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert!(!ids.contains(&t_done1.as_str()));
+    assert!(ids.contains(&t_done2.as_str()));
+    assert!(ids.contains(&t_todo.as_str()));
+
+    // archived_only=true returns only archived tickets
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/kanban?archived_only=true")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arch_board = body_json(resp).await;
+    assert_eq!(arch_board["tickets"].as_array().unwrap().len(), 1);
+    assert_eq!(arch_board["tickets"][0]["id"], t_done1);
+
+    // Unarchive restores it
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/api/v1/kanban/tickets/{t_done1}"))
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "archived": false }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_json(resp).await["ticket"]["archived_at"].is_null());
+
+    // POST /api/v1/kanban/archive-done clears both done tickets, keeps todo
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/kanban/archive-done")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["archived_count"], 2);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/kanban")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let board_after = body_json(resp).await;
+    let remaining = board_after["tickets"].as_array().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["id"], t_todo);
 }
